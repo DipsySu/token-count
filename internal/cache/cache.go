@@ -4,24 +4,41 @@ import (
 	"encoding/gob"
 	"os"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"time"
 
 	"token-count/internal/model"
 )
 
-// Bumped whenever the shape or meaning of a cached record changes; v4 added
-// deduplication keys for every agent, which entries cached earlier lack.
-const version = 4
+// Bumped whenever the shape or meaning of a cached record changes; v5 stopped
+// counting the token_count events Codex publishes again unchanged, and keys
+// Codex records by thread, so Codex entries cached earlier are wrong.
+const version = 5
 
 func init() {
 	gob.Register(time.Time{})
 	gob.Register(model.Usage{})
 }
 
-type entry struct {
+// FileState is what the cache knows a file by. Records are served only while
+// the file still has the state they were parsed from.
+type FileState struct {
 	ModNano int64
 	Size    int64
+}
+
+// Stat reads the current state of the file at path.
+func Stat(path string) (FileState, error) {
+	st, err := os.Stat(path)
+	if err != nil {
+		return FileState{}, err
+	}
+	return FileState{ModNano: st.ModTime().UnixNano(), Size: st.Size()}, nil
+}
+
+type entry struct {
+	State   FileState
 	Records []model.Usage
 }
 
@@ -44,7 +61,7 @@ func DefaultPath() string {
 		home, _ := os.UserHomeDir()
 		root = filepath.Join(home, ".cache")
 	}
-	return filepath.Join(root, "token-count", "index-v4.gob")
+	return filepath.Join(root, "token-count", "index-v"+strconv.Itoa(version)+".gob")
 }
 
 func New(path string, enabled bool) *Cache {
@@ -78,37 +95,31 @@ func (c *Cache) load() {
 	c.data = data
 }
 
-func (c *Cache) Get(path string) ([]model.Usage, bool) {
+// Get returns the records cached for path, provided they were parsed from the
+// state the file has now.
+func (c *Cache) Get(path string, now FileState) ([]model.Usage, bool) {
 	if !c.enabled {
-		return nil, false
-	}
-	st, err := os.Stat(path)
-	if err != nil {
 		return nil, false
 	}
 	c.mu.RLock()
 	ent, ok := c.data.Files[path]
 	c.mu.RUnlock()
-	if !ok || ent.ModNano != st.ModTime().UnixNano() || ent.Size != st.Size() {
+	if !ok || ent.State != now {
 		return nil, false
 	}
 	return ent.Records, true
 }
 
-func (c *Cache) Put(path string, records []model.Usage) {
+// Put stores the records parsed from path while it had state st. The caller
+// says which state that was because only it knows: by the time the parse
+// finishes an agent may have appended to the file, and reading the state then
+// would bind the records to contents they do not describe.
+func (c *Cache) Put(path string, st FileState, records []model.Usage) {
 	if !c.enabled {
 		return
 	}
-	st, err := os.Stat(path)
-	if err != nil {
-		return
-	}
 	c.mu.Lock()
-	c.data.Files[path] = entry{
-		ModNano: st.ModTime().UnixNano(),
-		Size:    st.Size(),
-		Records: records,
-	}
+	c.data.Files[path] = entry{State: st, Records: records}
 	c.dirty = true
 	c.mu.Unlock()
 }

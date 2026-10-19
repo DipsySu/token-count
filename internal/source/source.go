@@ -1,10 +1,12 @@
 package source
 
 import (
+	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strings"
 	"sync"
 
@@ -14,12 +16,26 @@ import (
 
 type ProgressFunc func(agent string, files, records int)
 
-// Stats describes what a collection pass saw before and after deduplication.
+// Stats describes what a collection pass saw before and after deduplication,
+// and which files it could not read completely.
 type Stats struct {
 	Raw           int
 	Kept          int
 	Dropped       int
 	DroppedTokens int64
+	// Issues lists the files and directories whose usage is missing from the
+	// totals, in whole or in part, sorted by agent and then path. It is empty
+	// when everything was read through.
+	Issues []Issue
+}
+
+// Issue names a file that was not read completely, or a directory that could
+// not be listed: whatever usage the unread part holds is missing from the
+// totals. Err says what went wrong, without repeating the path.
+type Issue struct {
+	Agent string `json:"agent"`
+	Path  string `json:"path"`
+	Err   string `json:"error"`
 }
 
 // Collect parses every session file for the requested agents and returns the
@@ -30,37 +46,52 @@ func Collect(agents []string, c *cache.Cache, progress ProgressFunc) []model.Usa
 }
 
 // CollectStats is Collect plus a report of how much replayed volume was
-// dropped. Deduplication has to happen here rather than inside a parser
-// because agents replay the same exchange across different files.
+// dropped, and of the files that could not be read completely. Deduplication
+// has to happen here rather than inside a parser because agents replay the
+// same exchange across different files.
 func CollectStats(agents []string, c *cache.Cache, progress ProgressFunc) ([]model.Usage, Stats) {
 	var (
-		mu  sync.Mutex
-		out []model.Usage
-		wg  sync.WaitGroup
+		mu     sync.Mutex
+		out    []model.Usage
+		issues []Issue
+		wg     sync.WaitGroup
 	)
 	for _, agent := range agents {
 		agent := agent
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			recs := collectAgent(agent, c)
+			recs, bad := collectAgent(agent, c)
 			if progress != nil {
 				progress(agent, -1, len(recs))
 			}
-			if len(recs) == 0 {
+			if len(recs) == 0 && len(bad) == 0 {
 				return
 			}
 			mu.Lock()
 			out = append(out, recs...)
+			issues = append(issues, bad...)
 			mu.Unlock()
 		}()
 	}
 	wg.Wait()
 
-	stats := Stats{Raw: len(out)}
+	sortIssues(issues)
+	stats := Stats{Raw: len(out), Issues: issues}
 	kept := dedup(out, &stats)
 	stats.Kept = len(kept)
 	return kept, stats
+}
+
+// sortIssues orders issues by agent and then path. Files are parsed in
+// parallel, so without it the order would change from run to run.
+func sortIssues(issues []Issue) {
+	sort.Slice(issues, func(i, j int) bool {
+		if issues[i].Agent != issues[j].Agent {
+			return issues[i].Agent < issues[j].Agent
+		}
+		return issues[i].Path < issues[j].Path
+	})
 }
 
 // dedup collapses records that describe the same upstream response, keeping
@@ -107,16 +138,24 @@ func dedup(recs []model.Usage, stats *Stats) []model.Usage {
 	return out
 }
 
-func collectAgent(agent string, c *cache.Cache) []model.Usage {
+func collectAgent(agent string, c *cache.Cache) ([]model.Usage, []Issue) {
 	roots, match, parse := agentSpec(agent)
 	if len(roots) == 0 {
-		return nil
+		return nil, nil
 	}
-	return mapFiles(listFiles(roots, match), c, parse)
+	files, unread := listFiles(roots, match)
+	recs, issues := mapFiles(agent, files, c, parse)
+	for _, d := range unread {
+		issues = append(issues, Issue{Agent: agent, Path: d.path, Err: describe(d.path, d.err)})
+	}
+	return recs, issues
 }
 
 type matcher func(path string, d fs.DirEntry) bool
-type parser func(path string) []model.Usage
+
+// parser reads one session file. Alongside whatever records it could read, it
+// returns an error when the file was not read completely.
+type parser func(path string) ([]model.Usage, error)
 
 // agentSpec returns every directory to scan for an agent. There can be more
 // than one: a machine may hold a migrated snapshot alongside the live data, and
@@ -170,7 +209,8 @@ func Infos() []model.SourceInfo {
 			info := model.SourceInfo{Agent: s.agent, Root: root, Note: s.note}
 			if st, err := os.Stat(root); err == nil && st.IsDir() {
 				info.Exists = true
-				info.Files = len(listFiles([]string{root}, match))
+				files, _ := listFiles([]string{root}, match)
+				info.Files = len(files)
 			}
 			out = append(out, info)
 		}
@@ -292,42 +332,71 @@ func geminiChat(path string, d fs.DirEntry) bool {
 	return filepath.Base(filepath.Dir(path)) == "chats"
 }
 
+// unreadDir is a directory that listFiles could not list.
+type unreadDir struct {
+	path string
+	err  error
+}
+
 // listFiles walks every root, returning each matching file once. Roots can
 // overlap or nest, so files are deduplicated by absolute path rather than
 // parsed twice and reconciled later.
-func listFiles(roots []string, match matcher) []string {
-	var out []string
+//
+// It also returns the directories it could not list, roots included, since
+// every session below one is missing from the totals. One that does not exist
+// holds none: a root the agent never created, or a directory removed while
+// the walk was under way. The walk carries on past the others.
+func listFiles(roots []string, match matcher) ([]string, []unreadDir) {
+	var (
+		out    []string
+		unread []unreadDir
+	)
 	seen := map[string]struct{}{}
+	first := func(path string) bool {
+		key := path
+		if abs, err := filepath.Abs(path); err == nil {
+			key = abs
+		}
+		if _, dup := seen[key]; dup {
+			return false
+		}
+		seen[key] = struct{}{}
+		return true
+	}
+	failed := func(path string, err error) {
+		if !errors.Is(err, fs.ErrNotExist) && first(path) {
+			unread = append(unread, unreadDir{path, err})
+		}
+	}
 	for _, root := range roots {
 		st, err := os.Stat(root)
-		if err != nil || !st.IsDir() {
+		if err != nil {
+			failed(root, err)
+			continue
+		}
+		if !st.IsDir() {
 			continue
 		}
 		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-			if err != nil || d.IsDir() {
+			if err != nil {
+				failed(path, err)
 				return nil
 			}
-			if match == nil || !match(path, d) {
+			if d.IsDir() || match == nil || !match(path, d) {
 				return nil
 			}
-			key := path
-			if abs, err := filepath.Abs(path); err == nil {
-				key = abs
+			if first(path) {
+				out = append(out, path)
 			}
-			if _, dup := seen[key]; dup {
-				return nil
-			}
-			seen[key] = struct{}{}
-			out = append(out, path)
 			return nil
 		})
 	}
-	return out
+	return out, unread
 }
 
-func mapFiles(files []string, c *cache.Cache, parse parser) []model.Usage {
+func mapFiles(agent string, files []string, c *cache.Cache, parse parser) ([]model.Usage, []Issue) {
 	if len(files) == 0 {
-		return nil
+		return nil, nil
 	}
 	workers := runtime.GOMAXPROCS(0)
 	if workers > 8 {
@@ -338,21 +407,25 @@ func mapFiles(files []string, c *cache.Cache, parse parser) []model.Usage {
 	}
 	in := make(chan string)
 	var (
-		mu  sync.Mutex
-		out []model.Usage
-		wg  sync.WaitGroup
+		mu     sync.Mutex
+		out    []model.Usage
+		issues []Issue
+		wg     sync.WaitGroup
 	)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for path := range in {
-				recs := parseCached(c, path, parse)
-				if len(recs) == 0 {
+				recs, err := parseCached(c, path, parse)
+				if len(recs) == 0 && err == nil {
 					continue
 				}
 				mu.Lock()
 				out = append(out, recs...)
+				if err != nil {
+					issues = append(issues, Issue{Agent: agent, Path: path, Err: describe(path, err)})
+				}
 				mu.Unlock()
 			}
 		}()
@@ -362,18 +435,58 @@ func mapFiles(files []string, c *cache.Cache, parse parser) []model.Usage {
 	}
 	close(in)
 	wg.Wait()
-	return out
+	return out, issues
 }
 
-func parseCached(c *cache.Cache, path string, parse parser) []model.Usage {
-	if c != nil {
-		if recs, ok := c.Get(path); ok {
-			return recs
-		}
+// parseCached returns the records of one file, from the cache when the file
+// has not changed since they were stored.
+//
+// Agents append to their logs while they run, possibly while the parse is
+// under way. The file is therefore examined before and after, and the records
+// are cached only if both agree, under the state they were read from. Caching
+// them against a state read afterwards would match the grown file, and every
+// later pass would serve the stale result until the file changed again.
+//
+// A file that was not read completely is never cached: its records are
+// returned, with the error, but the next pass reads it again rather than
+// taking the part it got for the whole.
+func parseCached(c *cache.Cache, path string, parse parser) ([]model.Usage, error) {
+	if c == nil {
+		return parseListed(path, parse)
 	}
-	recs := parse(path)
-	if c != nil {
-		c.Put(path, recs)
+	before, err := cache.Stat(path)
+	if err != nil {
+		return parseListed(path, parse)
 	}
-	return recs
+	if recs, ok := c.Get(path, before); ok {
+		return recs, nil
+	}
+	recs, err := parseListed(path, parse)
+	if err != nil {
+		return recs, err
+	}
+	if after, err := cache.Stat(path); err == nil && after == before {
+		c.Put(path, before, recs)
+	}
+	return recs, nil
+}
+
+// parseListed parses a file that the listing found. One that has disappeared
+// since, as when an agent prunes old sessions, holds nothing to count, which
+// is not a failure to read it.
+func parseListed(path string, parse parser) ([]model.Usage, error) {
+	recs, err := parse(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return recs, nil
+	}
+	return recs, err
+}
+
+// describe words a parse error for an Issue. The path has a field of its own,
+// so the copy that os errors carry is left out.
+func describe(path string, err error) string {
+	if pe, ok := err.(*fs.PathError); ok && pe.Path == path {
+		return pe.Op + ": " + pe.Err.Error()
+	}
+	return err.Error()
 }

@@ -3,10 +3,12 @@ package source
 import (
 	"path/filepath"
 	"testing"
+
+	"token-count/internal/model"
 )
 
 func TestParseClaude(t *testing.T) {
-	recs := parseClaude(filepath.Join("testdata", "claude.jsonl"))
+	recs := parseFile(t, parseClaude, filepath.Join("testdata", "claude.jsonl"))
 	if len(recs) != 1 {
 		t.Fatalf("got %d records", len(recs))
 	}
@@ -20,7 +22,7 @@ func TestParseClaude(t *testing.T) {
 }
 
 func TestParseCodex(t *testing.T) {
-	recs := parseCodex(filepath.Join("testdata", "codex.jsonl"))
+	recs := parseFile(t, parseCodex, filepath.Join("testdata", "codex.jsonl"))
 	if len(recs) != 2 {
 		t.Fatalf("got %d records", len(recs))
 	}
@@ -36,7 +38,7 @@ func TestParseCodex(t *testing.T) {
 }
 
 func TestParseGrok(t *testing.T) {
-	recs := parseGrok(filepath.Join("testdata", "grok_updates.jsonl"))
+	recs := parseFile(t, parseGrok, filepath.Join("testdata", "grok_updates.jsonl"))
 	if len(recs) != 1 {
 		t.Fatalf("got %d records: %+v", len(recs), recs)
 	}
@@ -46,4 +48,15 @@ func TestParseGrok(t *testing.T) {
 	if recs[0].CacheRead != 80 || recs[0].Input != 20 {
 		t.Fatalf("tokens %+v", recs[0])
 	}
+}
+
+// parseFile runs a parser on one file and fails the test if it reports an
+// error.
+func parseFile(t *testing.T, parse parser, path string) []model.Usage {
+	t.Helper()
+	recs, err := parse(path)
+	if err != nil {
+		t.Fatalf("%s: %v", path, err)
+	}
+	return recs
 }

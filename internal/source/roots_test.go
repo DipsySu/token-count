@@ -1,6 +1,8 @@
 package source
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -78,20 +80,57 @@ func TestListFilesDeduplicatesOverlappingRoots(t *testing.T) {
 		}
 	}
 	match := suffix(".jsonl")
+	list := func(roots ...string) []string {
+		t.Helper()
+		files, unread := listFiles(roots, match)
+		if len(unread) != 0 {
+			t.Errorf("roots %v: unreadable %+v", roots, unread)
+		}
+		return files
+	}
 
-	if got := listFiles([]string{root}, match); len(got) != 2 {
+	if got := list(root); len(got) != 2 {
 		t.Fatalf("single root found %d files", len(got))
 	}
 	// The same root twice, and a root nested inside another, both collapse.
-	if got := listFiles([]string{root, root}, match); len(got) != 2 {
+	if got := list(root, root); len(got) != 2 {
 		t.Errorf("repeated root found %d files, want 2", len(got))
 	}
-	if got := listFiles([]string{root, nested}, match); len(got) != 2 {
+	if got := list(root, nested); len(got) != 2 {
 		t.Errorf("nested roots found %d files, want 2", len(got))
 	}
-	// A missing root is skipped rather than failing the whole scan.
-	if got := listFiles([]string{filepath.Join(root, "nope"), root}, match); len(got) != 2 {
+	// A missing root is skipped rather than failing the whole scan, and is
+	// not reported: there is nothing in it to miss.
+	if got := list(filepath.Join(root, "nope"), root); len(got) != 2 {
 		t.Errorf("missing root broke the scan: %d files", len(got))
+	}
+}
+
+// A directory that cannot be listed is reported once, however many of the
+// roots reach it, and the walk carries on past it.
+func TestListFilesReportsUnreadableDirectoryOnce(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root reads directories regardless of their permissions")
+	}
+	root := t.TempDir()
+	nested := filepath.Join(root, "a")
+	for _, dir := range []string{"b", "c"} {
+		if err := os.MkdirAll(filepath.Join(nested, dir), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(nested, dir, "s.jsonl"), []byte("{}\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locked := filepath.Join(nested, "b")
+	lock(t, locked)
+
+	files, unread := listFiles([]string{root, nested, root}, suffix(".jsonl"))
+	if len(files) != 1 || files[0] != filepath.Join(nested, "c", "s.jsonl") {
+		t.Errorf("found %v, want only the readable file", files)
+	}
+	if len(unread) != 1 || unread[0].path != locked || !errors.Is(unread[0].err, fs.ErrPermission) {
+		t.Errorf("unreadable %+v, want %s once", unread, locked)
 	}
 }
 

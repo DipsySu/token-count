@@ -4,6 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -17,11 +20,11 @@ import (
 // parseClaude reads a Claude Code session log. Claude replays earlier messages
 // into new files when a session is resumed or forked, so every record carries a
 // dedup key built from the upstream message and request ids.
-func parseClaude(path string) []model.Usage {
+func parseClaude(path string) ([]model.Usage, error) {
 	var out []model.Usage
 	cwd := ""
 	seq := 0
-	_ = forEachJSONL(path, func(line []byte) {
+	err := forEachJSONL(path, func(line []byte) {
 		var rec struct {
 			Type      string `json:"type"`
 			Timestamp string `json:"timestamp"`
@@ -77,7 +80,7 @@ func parseClaude(path string) []model.Usage {
 			out = append(out, usage)
 		}
 	})
-	return backfillProject(out, cwd)
+	return backfillProject(out, cwd), err
 }
 
 // claudeKey identifies one upstream response. Both ids are present in current
@@ -99,27 +102,52 @@ func claudeKey(messageID, requestID, path string, seq int) string {
 	}
 }
 
-// parseCodex reads a Codex rollout log. Codex reports last_token_usage as the
-// delta for the exchange that just finished, so records are already additive.
-func parseCodex(path string) []model.Usage {
+// parseCodex reads a Codex rollout log. Every token_count event carries two
+// figures: last_token_usage, what the exchange that just finished cost, and
+// total_token_usage, the running sum for the thread. Codex publishes the event
+// again whenever something else changes -- the rate limits refresh, the context
+// is compacted, a resumed process announces itself -- so one exchange can
+// appear several times, and summing every event overstated a real history by
+// almost 10%. An event whose running total equals the previous one is such a
+// re-publication and is skipped.
+//
+// The running total serves only to recognise those. It does not measure what
+// an exchange cost: a resumed process starts a fresh total, or one that already
+// includes usage recorded elsewhere, so across a resume consecutive totals can
+// differ by millions of tokens more, or fewer, than the exchange in between.
+// last_token_usage is therefore the cost whenever it is present, and the
+// difference of totals only stands in for an event that lacks it.
+func parseCodex(path string) ([]model.Usage, error) {
 	var out []model.Usage
 	modelName := ""
 	cwd := ""
-	// Codex has no per-response id, so identity is the session plus the
-	// position of the event within it. Both survive a file being copied
+	// token_count events carry no response id, so identity is the thread plus
+	// the position of the exchange within it. Both survive a file being copied
 	// elsewhere, which is what deduplication across roots needs. A timestamp
 	// is not enough on its own: consecutive events can share one.
 	//
-	// session_meta is the first line, so its session_id is in hand before any
-	// usage event; the filename stem stands in if a log lacks it.
-	session := ""
+	// The thread is the id in the log's first session_meta, which precedes any
+	// usage event; the filename stem stands in if a log lacks it. session_id
+	// will not do: recent versions put the root session's id there in a
+	// subagent's log, which also quotes its parent's session_meta, so keying on
+	// it merged every subagent's exchanges with its parent's.
+	//
+	// Only counted exchanges advance the position. A re-publication is not an
+	// exchange, and what triggers one has nothing to do with the conversation,
+	// so letting it shift the exchanges after it would make their keys depend
+	// on timing rather than on what was said. Either way a key is a function of
+	// the file's contents, which is all that matching a copy needs.
+	thread := ""
 	seq := 0
-	_ = forEachJSONL(path, func(line []byte) {
+	// prev is the running total of the latest usable event that reported one.
+	var prev *codexTokens
+	err := forEachJSONL(path, func(line []byte) {
 		var rec struct {
 			Timestamp string `json:"timestamp"`
 			Type      string `json:"type"`
 			Payload   struct {
 				Type           string `json:"type"`
+				ID             string `json:"id"`
 				Model          string `json:"model"`
 				Cwd            string `json:"cwd"`
 				SessionID      string `json:"session_id"`
@@ -127,13 +155,8 @@ func parseCodex(path string) []model.Usage {
 					Model string `json:"model"`
 				} `json:"thread_settings"`
 				Info *struct {
-					LastTokenUsage *struct {
-						InputTokens           int64 `json:"input_tokens"`
-						CachedInputTokens     int64 `json:"cached_input_tokens"`
-						CacheWriteInputTokens int64 `json:"cache_write_input_tokens"`
-						OutputTokens          int64 `json:"output_tokens"`
-						ReasoningOutputTokens int64 `json:"reasoning_output_tokens"`
-					} `json:"last_token_usage"`
+					LastTokenUsage  *codexTokens `json:"last_token_usage"`
+					TotalTokenUsage *codexTokens `json:"total_token_usage"`
 				} `json:"info"`
 			} `json:"payload"`
 		}
@@ -143,12 +166,17 @@ func parseCodex(path string) []model.Usage {
 		if rec.Payload.Cwd != "" && cwd == "" {
 			cwd = rec.Payload.Cwd
 		}
-		if rec.Payload.SessionID != "" {
-			session = rec.Payload.SessionID
-		}
 		switch {
-		case rec.Type == "session_meta" && rec.Payload.Model != "":
-			modelName = rec.Payload.Model
+		case rec.Type == "session_meta":
+			if thread == "" {
+				thread = rec.Payload.ID
+				if thread == "" {
+					thread = rec.Payload.SessionID
+				}
+			}
+			if rec.Payload.Model != "" {
+				modelName = rec.Payload.Model
+			}
 			return
 		case rec.Type == "turn_context" && rec.Payload.Model != "":
 			modelName = rec.Payload.Model
@@ -161,16 +189,27 @@ func parseCodex(path string) []model.Usage {
 		case rec.Type != "event_msg" || rec.Payload.Type != "token_count":
 			return
 		}
-		if rec.Payload.Info == nil || rec.Payload.Info.LastTokenUsage == nil {
+		info := rec.Payload.Info
+		if info == nil {
 			return
 		}
+		// An event without a usable time is dropped whole, like a malformed
+		// line. Were its total kept as the baseline, a re-publication of the
+		// same state with a readable time would be skipped as a repeat, and
+		// the exchange would not be counted at all.
 		ts, ok := model.ParseTime(rec.Timestamp)
 		if !ok {
 			return
 		}
-		last := rec.Payload.Info.LastTokenUsage
+		use, counted := codexExchange(info.LastTokenUsage, info.TotalTokenUsage, prev)
+		if info.TotalTokenUsage != nil {
+			prev = info.TotalTokenUsage
+		}
+		if !counted {
+			return
+		}
 		seq++
-		id := session
+		id := thread
 		if id == "" {
 			id = strings.TrimSuffix(filepath.Base(path), ".jsonl")
 		}
@@ -178,11 +217,11 @@ func parseCodex(path string) []model.Usage {
 			Agent:                   "codex",
 			Time:                    ts,
 			Model:                   modelName,
-			Input:                   last.InputTokens,
-			CacheRead:               last.CachedInputTokens,
-			CacheWrite:              last.CacheWriteInputTokens,
-			Output:                  last.OutputTokens,
-			Reasoning:               last.ReasoningOutputTokens,
+			Input:                   use.InputTokens,
+			CacheRead:               use.CachedInputTokens,
+			CacheWrite:              use.CacheWriteInputTokens,
+			Output:                  use.OutputTokens,
+			Reasoning:               use.ReasoningOutputTokens,
 			InputIncludesCache:      true,
 			OutputIncludesReasoning: true,
 			Dedup:                   seqKey("codex", id, seq),
@@ -191,7 +230,56 @@ func parseCodex(path string) []model.Usage {
 			out = append(out, usage)
 		}
 	})
-	return backfillProject(out, cwd)
+	return backfillProject(out, cwd), err
+}
+
+// codexTokens is one usage block of a token_count event. Input includes the
+// cached part and output includes reasoning, as Codex reports them.
+type codexTokens struct {
+	InputTokens           int64 `json:"input_tokens"`
+	CachedInputTokens     int64 `json:"cached_input_tokens"`
+	CacheWriteInputTokens int64 `json:"cache_write_input_tokens"`
+	OutputTokens          int64 `json:"output_tokens"`
+	ReasoningOutputTokens int64 `json:"reasoning_output_tokens"`
+}
+
+// codexExchange works out what one token_count event adds, given the running
+// total of the event before it (nil at the start of the log). It reports false
+// for an event that adds nothing: a re-publication, whose running total equals
+// the previous one, or an event that carries neither figure.
+func codexExchange(last, total, prev *codexTokens) (codexTokens, bool) {
+	if total != nil && prev != nil && *total == *prev {
+		return codexTokens{}, false
+	}
+	if last != nil {
+		return *last, true
+	}
+	if total == nil {
+		return codexTokens{}, false
+	}
+	if prev != nil {
+		if d, ok := total.since(*prev); ok {
+			return d, true
+		}
+	}
+	// The first total, or one that dropped because a resumed process started
+	// counting afresh, is all usage since that accumulator began.
+	return *total, true
+}
+
+// since returns how far the running total t moved on from prev, and false if
+// any field went down, which means t comes from a different accumulator.
+func (t codexTokens) since(prev codexTokens) (codexTokens, bool) {
+	d := codexTokens{
+		InputTokens:           t.InputTokens - prev.InputTokens,
+		CachedInputTokens:     t.CachedInputTokens - prev.CachedInputTokens,
+		CacheWriteInputTokens: t.CacheWriteInputTokens - prev.CacheWriteInputTokens,
+		OutputTokens:          t.OutputTokens - prev.OutputTokens,
+		ReasoningOutputTokens: t.ReasoningOutputTokens - prev.ReasoningOutputTokens,
+	}
+	ok := d.InputTokens >= 0 && d.CachedInputTokens >= 0 && d.CacheWriteInputTokens >= 0 &&
+		d.OutputTokens >= 0 && d.ReasoningOutputTokens >= 0
+	return d, ok
 }
 
 type grokUsage struct {
@@ -207,7 +295,7 @@ type grokUsage struct {
 // parseGrok reads a Grok ACP update stream. Each turn_completed carries the
 // usage for that turn only, and modelCalls says how many upstream requests the
 // turn actually made.
-func parseGrok(path string) []model.Usage {
+func parseGrok(path string) ([]model.Usage, error) {
 	fallback := ""
 	if data, err := os.ReadFile(filepath.Join(filepath.Dir(path), "summary.json")); err == nil {
 		var summary struct {
@@ -223,7 +311,7 @@ func parseGrok(path string) []model.Usage {
 	session := filepath.Base(filepath.Dir(path))
 	turn := 0
 	var out []model.Usage
-	_ = forEachJSONL(path, func(line []byte) {
+	err := forEachJSONL(path, func(line []byte) {
 		var rec struct {
 			Timestamp json.RawMessage `json:"timestamp"`
 			Params    struct {
@@ -262,7 +350,7 @@ func parseGrok(path string) []model.Usage {
 			}
 		}
 	})
-	return out
+	return out, err
 }
 
 // grokProject recovers the working directory from the session path, which Grok
@@ -296,11 +384,7 @@ func grokMake(path, project string, ts time.Time, name string, u grokUsage, dedu
 	})
 }
 
-func parseGemini(path string) []model.Usage {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
+func parseGemini(path string) ([]model.Usage, error) {
 	var rec struct {
 		Cwd      string `json:"cwd"`
 		Messages []struct {
@@ -316,8 +400,8 @@ func parseGemini(path string) []model.Usage {
 			} `json:"tokens"`
 		} `json:"messages"`
 	}
-	if json.Unmarshal(data, &rec) != nil {
-		return nil
+	if ok, err := readJSON(path, &rec); !ok {
+		return nil, err
 	}
 	// Gemini exposes no message id, so identity falls back to where the file
 	// sits relative to its root plus the message's position. That is stable
@@ -360,14 +444,10 @@ func parseGemini(path string) []model.Usage {
 			out = append(out, usage)
 		}
 	}
-	return out
+	return out, nil
 }
 
-func parseOpenCode(path string) []model.Usage {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil
-	}
+func parseOpenCode(path string) ([]model.Usage, error) {
 	var rec struct {
 		ID      string `json:"id"`
 		Role    string `json:"role"`
@@ -391,8 +471,11 @@ func parseOpenCode(path string) []model.Usage {
 			Completed int64 `json:"completed"`
 		} `json:"time"`
 	}
-	if json.Unmarshal(data, &rec) != nil || rec.Role != "assistant" || rec.Tokens == nil {
-		return nil
+	if ok, err := readJSON(path, &rec); !ok {
+		return nil, err
+	}
+	if rec.Role != "assistant" || rec.Tokens == nil {
+		return nil, nil
 	}
 	var unix int64
 	if rec.Time != nil {
@@ -403,7 +486,7 @@ func parseOpenCode(path string) []model.Usage {
 	}
 	ts, ok := model.ParseTime(unix)
 	if !ok {
-		return nil
+		return nil, nil
 	}
 	var cr, cw int64
 	if rec.Tokens.Cache != nil {
@@ -439,9 +522,9 @@ func parseOpenCode(path string) []model.Usage {
 		Dedup:                   dedup,
 		Source:                  path,
 	}); ok {
-		return []model.Usage{usage}
+		return []model.Usage{usage}, nil
 	}
-	return nil
+	return nil, nil
 }
 
 // seqKey builds a deduplication key from a session identity and a position
@@ -478,20 +561,151 @@ func backfillProject(recs []model.Usage, cwd string) []model.Usage {
 	return recs
 }
 
+// readJSON decodes a log that is a single JSON document. It reports false,
+// with no error, for a file that holds JSON of another shape: there is nothing
+// of ours in it to count. Any other failure is returned -- a read error, or
+// JSON that is malformed or cut short, down to an empty file, as one caught
+// while being rewritten is -- because that file's records are missing from
+// the totals.
+func readJSON(path string, v any) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, err
+	}
+	if err := json.Unmarshal(data, v); err != nil {
+		var shape *json.UnmarshalTypeError
+		if errors.As(err, &shape) {
+			return false, nil
+		}
+		return false, fmt.Errorf("malformed JSON: %w", err)
+	}
+	return true, nil
+}
+
+// maxLineBytes is the longest JSONL line that is parsed. Nothing near it is a
+// usage record -- such a line is a huge tool output or a corrupt file -- so a
+// longer line is skipped, and reported, rather than held in memory. It is a
+// variable so that tests can lower it.
+var maxLineBytes = 64 << 20
+
+// forEachJSONL calls fn with every non-blank line of a JSONL file, trimmed of
+// surrounding space. The slice is only valid until fn returns.
+//
+// A line longer than maxLineBytes is skipped and reading carries on with the
+// next; the skipped lines are reported in the error returned at the end,
+// because whatever usage they held is missing from the totals. bufio.Scanner,
+// used before, stopped for good at the first such line, so the records after
+// it were lost without a word. A read error ends the walk and is returned.
 func forEachJSONL(path string, fn func([]byte)) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
-	sc := bufio.NewScanner(f)
-	sc.Buffer(make([]byte, 1024*1024), 64*1024*1024)
-	for sc.Scan() {
-		line := bytes.TrimSpace(sc.Bytes())
-		if len(line) == 0 {
+	lr := lineReader{r: bufio.NewReaderSize(f, 64<<10)}
+	var skipped *longLinesError
+	for {
+		line, tooLong, err := lr.next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+		if tooLong {
+			if skipped == nil {
+				skipped = &longLinesError{first: lr.n, limit: maxLineBytes}
+			}
+			skipped.count++
 			continue
 		}
-		fn(line)
+		if line = bytes.TrimSpace(line); len(line) > 0 {
+			fn(line)
+		}
 	}
-	return sc.Err()
+	if skipped != nil {
+		return skipped
+	}
+	return nil
+}
+
+// lineReader splits a stream into lines without ever holding more than
+// maxLineBytes of one.
+type lineReader struct {
+	r   *bufio.Reader
+	buf []byte // assembles a line too long for r's buffer
+	n   int    // the number of the line last returned, from 1
+}
+
+// next returns the next line without its newline. A line longer than
+// maxLineBytes is read to its end in pieces and dropped: next reports it with
+// tooLong set and no content. After the last line, which may lack a newline,
+// next returns io.EOF.
+func (lr *lineReader) next() (line []byte, tooLong bool, err error) {
+	lr.buf = lr.buf[:0]
+	size := 0
+	for {
+		var chunk []byte
+		chunk, err = lr.r.ReadSlice('\n')
+		more := err == bufio.ErrBufferFull
+		switch {
+		case err == nil:
+			chunk = chunk[:len(chunk)-1]
+		case err == io.EOF:
+			if size == 0 && len(chunk) == 0 {
+				return nil, false, io.EOF
+			}
+		case !more:
+			return nil, false, err
+		}
+		size += len(chunk)
+		switch {
+		case size > maxLineBytes:
+			// Keep none of it, but read on to its end. The buffer goes too,
+			// rather than sit at the limit for the rest of the file.
+			lr.buf = nil
+		case !more && len(lr.buf) == 0:
+			// The whole line arrived at once, as nearly every line does, so
+			// it is used where it lies.
+			line = chunk
+		default:
+			// The buffer doubles as it fills, as bufio.Scanner's did, up to
+			// the limit. append grows a large slice by a quarter at a time,
+			// and the copies it left behind came to about five times the
+			// line.
+			if need := len(lr.buf) + len(chunk); need > cap(lr.buf) {
+				grown := make([]byte, len(lr.buf), max(need, min(2*cap(lr.buf), maxLineBytes)))
+				copy(grown, lr.buf)
+				lr.buf = grown
+			}
+			lr.buf = append(lr.buf, chunk...)
+			line = lr.buf
+		}
+		if !more {
+			lr.n++
+			if size > maxLineBytes {
+				return nil, true, nil
+			}
+			return line, false, nil
+		}
+	}
+}
+
+// longLinesError reports the lines forEachJSONL skipped for being longer than
+// maxLineBytes.
+type longLinesError struct {
+	count int // how many were skipped
+	first int // the number of the first, from 1
+	limit int
+}
+
+func (e *longLinesError) Error() string {
+	limit := strconv.Itoa(e.limit) + " bytes"
+	if e.limit >= 1<<20 && e.limit%(1<<20) == 0 {
+		limit = strconv.Itoa(e.limit>>20) + " MiB"
+	}
+	if e.count == 1 {
+		return fmt.Sprintf("line %d is longer than %s and was not counted", e.first, limit)
+	}
+	return fmt.Sprintf("%d lines longer than %s were not counted, the first at line %d", e.count, limit, e.first)
 }

@@ -76,7 +76,7 @@ func TestDedupIsPerAgent(t *testing.T) {
 }
 
 func TestParseClaudeDeduplicatesAndKeepsProject(t *testing.T) {
-	recs := parseClaude(filepath.Join("testdata", "claude_dupes.jsonl"))
+	recs := parseFile(t, parseClaude, filepath.Join("testdata", "claude_dupes.jsonl"))
 	if len(recs) != 3 {
 		t.Fatalf("parser should emit every line: got %d", len(recs))
 	}
@@ -236,16 +236,17 @@ func TestDedupPreservesPosition(t *testing.T) {
 func TestEveryParserEmitsDedupKeys(t *testing.T) {
 	cases := []struct {
 		name  string
-		parse func(string) []model.Usage
+		parse parser
 		file  string
 	}{
 		{"claude", parseClaude, "claude.jsonl"},
 		{"claude-dupes", parseClaude, "claude_dupes.jsonl"},
 		{"codex", parseCodex, "codex.jsonl"},
+		{"codex-republished", parseCodex, "codex_republished.jsonl"},
 		{"grok", parseGrok, "grok_updates.jsonl"},
 	}
 	for _, c := range cases {
-		recs := c.parse(filepath.Join("testdata", c.file))
+		recs := parseFile(t, c.parse, filepath.Join("testdata", c.file))
 		if len(recs) == 0 {
 			t.Fatalf("%s: parsed nothing", c.name)
 		}
@@ -275,11 +276,12 @@ func TestEveryParserEmitsDedupKeys(t *testing.T) {
 func TestKeysAreStableAcrossRoots(t *testing.T) {
 	cases := []struct {
 		name  string
-		parse func(string) []model.Usage
+		parse parser
 		file  string
 		rel   string // where the file sits inside its root
 	}{
 		{"codex", parseCodex, "codex.jsonl", "sessions/2026/08/25"},
+		{"codex-republished", parseCodex, "codex_republished.jsonl", "sessions/2026/08/25"},
 		{"claude", parseClaude, "claude.jsonl", "projects/-home-u-proj"},
 		{"claude-dupes", parseClaude, "claude_dupes.jsonl", "projects/-home-u-proj"},
 	}
@@ -300,7 +302,7 @@ func TestKeysAreStableAcrossRoots(t *testing.T) {
 			if err := os.WriteFile(dst, data, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			parsed = append(parsed, c.parse(dst))
+			parsed = append(parsed, parseFile(t, c.parse, dst))
 		}
 		a, b := parsed[0], parsed[1]
 		if len(a) == 0 {

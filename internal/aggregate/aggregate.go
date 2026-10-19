@@ -2,6 +2,8 @@ package aggregate
 
 import (
 	"fmt"
+	"math/bits"
+	"slices"
 	"sort"
 	"time"
 
@@ -29,22 +31,82 @@ const (
 	ViewHeat    View = "heat"
 )
 
+// Filter keeps the records dated from since through until; a nil bound leaves
+// that side open. A record's date is its local calendar date. since admits
+// the dates whose midnight, the instant Day gives for them, is not before it,
+// and until those whose midnight is not after it, so a bound that is itself a
+// midnight admits its own date. When every record is kept, Filter returns
+// records itself.
+//
+// Rather than convert every timestamp to its local date, which dominated the
+// cost, Filter turns the bounds into the instants at which the first admitted
+// date begins and the last one ends, and compares timestamps with those.
 func Filter(records []model.Usage, since, until *time.Time) []model.Usage {
 	if since == nil && until == nil {
 		return records
 	}
-	out := make([]model.Usage, 0, len(records))
-	for _, r := range records {
-		d := r.Date()
-		if since != nil && d.Before(*since) {
+	var from, to stamp
+	if since != nil {
+		from = stampOf(firstAt(firstDateFrom(*since)))
+	}
+	if until != nil {
+		to = stampOf(firstAt(lastDateTo(*until).AddDate(0, 0, 1)))
+	}
+	// With dates out of the way, what costs is reading the records, which are
+	// large. Rather than read them all twice, once to count and once to copy,
+	// one pass decides each and notes it in a bitset, and the copy reads only
+	// the records kept, 64 at once where a word keeps them all. The result is
+	// still exactly as long as it needs to be: a recent window keeps a small
+	// share of the archive, and a slice as long as the input is megabytes.
+	kept := make([]uint64, (len(records)+63)/64)
+	n := 0
+	for i := range records {
+		t := stampOf(records[i].Time)
+		if (since == nil || !t.before(from)) && (until == nil || t.before(to)) {
+			kept[i/64] |= 1 << (i % 64)
+			n++
+		}
+	}
+	if n == len(records) {
+		return records
+	}
+	out := make([]model.Usage, 0, n)
+	for w, word := range kept {
+		i := w * 64
+		if word == ^uint64(0) {
+			out = append(out, records[i:i+64]...)
 			continue
 		}
-		if until != nil && d.After(*until) {
-			continue
+		for ; word != 0; word &= word - 1 {
+			out = append(out, records[i+bits.TrailingZeros64(word)])
 		}
-		out = append(out, r)
 	}
 	return out
+}
+
+// firstDateFrom is the earliest date whose midnight is not before t. No date
+// before t's own can be: its midnight reads an earlier day than t does.
+func firstDateFrom(t time.Time) time.Time {
+	d := civil(t)
+	for midnight(d).Before(t) {
+		d = d.AddDate(0, 0, 1)
+	}
+	return d
+}
+
+// lastDateTo is the latest date whose midnight is not after t. It can be the
+// day after t's own, where that day's midnight was skipped, or the day
+// before, where t falls in the first of two passes through midnight and
+// time.Date chose the second.
+func lastDateTo(t time.Time) time.Time {
+	d := civil(t)
+	for !midnight(d.AddDate(0, 0, 1)).After(t) {
+		d = d.AddDate(0, 0, 1)
+	}
+	for midnight(d).After(t) {
+		d = d.AddDate(0, 0, -1)
+	}
+	return d
 }
 
 func FilterAgent(records []model.Usage, agent string) []model.Usage {
@@ -60,43 +122,144 @@ func FilterAgent(records []model.Usage, agent string) []model.Usage {
 	return out
 }
 
-func Day(t time.Time) time.Time {
+// A calendar date crosses this package's API as the instant time.Date gives
+// for its local midnight, which is also how Usage.Date and the --since and
+// --until flags stand for one. Inside, a date is held as midnight UTC, where
+// stepping and counting days is exact: a local day lasts 23 or 25 hours
+// across a DST change, so dividing a local duration by 24 hours merges or
+// splits days. Timestamps are compared with the instant a local day really
+// begins, which time.Date does not always give: where a DST change skips
+// midnight it moves that midnight by the time skipped, back into the evening
+// before west of Greenwich (east of it, on to the instant the day does
+// begin), and where one repeats midnight it may pick the second of the two.
+// That a range of dates is a range of instants relies on the local date never
+// running backwards, which has held in every zone since 2010, when
+// Newfoundland last turned its clocks back from 00:01 to 23:01 the evening
+// before.
+
+// civil is t's local calendar date, held as midnight UTC.
+func civil(t time.Time) time.Time {
 	y, m, d := t.In(time.Local).Date()
-	return time.Date(y, m, d, 0, 0, 0, 0, time.Local)
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+// dateOf is the date t stands for: its local date, except that a midnight
+// time.Date moved into the evening before stands for its own day, so the
+// helpers that return midnights accept their own results. Where a whole day
+// was skipped, as Apia skipped 2011-12-30, time.Date gives that day's
+// midnight and the one before as the same instant, which stands for the day
+// that happened.
+func dateOf(t time.Time) time.Time {
+	d := civil(t)
+	if next := d.AddDate(0, 0, 1); midnight(next).Equal(t) && !midnight(d).Equal(t) {
+		return next
+	}
+	return d
+}
+
+// midnight is the instant that stands for date in the API.
+func midnight(date time.Time) time.Time {
+	return time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.Local)
+}
+
+// reading is what the local wall clock shows at t, held as a UTC time.
+func reading(t time.Time) time.Time {
+	l := t.In(time.Local)
+	return time.Date(l.Year(), l.Month(), l.Day(), l.Hour(), l.Minute(), l.Second(), l.Nanosecond(), time.UTC)
+}
+
+// firstAt is the first instant at which the local clock shows wall, a reading
+// held as a UTC time, or later; for a midnight that is the instant the day
+// begins. time.Date only promises an instant that shows wall in one of the
+// offsets around a DST change: when the change skips the reading it may
+// answer from before the change with an earlier one, and when the change
+// repeats the reading it may pick the second time round.
+func firstAt(wall time.Time) time.Time {
+	t := time.Date(wall.Year(), wall.Month(), wall.Day(),
+		wall.Hour(), wall.Minute(), wall.Second(), wall.Nanosecond(), time.Local)
+	if reading(t).Before(wall) {
+		// The reading was skipped: the clock first passes it when it jumps.
+		if _, end := t.ZoneBounds(); !end.IsZero() {
+			t = end
+		}
+	}
+	// Within one zone period the clock runs evenly, so the period's first
+	// instant at or past wall is where it shows wall exactly, or the period's
+	// start if it began past wall. If the clock had already got there before
+	// the period began, the answer lies in an earlier period.
+	for {
+		start, _ := t.ZoneBounds()
+		_, offset := t.Zone()
+		first := wall.Add(-time.Duration(offset) * time.Second)
+		if first.Before(start) {
+			first = start
+		}
+		if start.IsZero() || reading(start.Add(-time.Nanosecond)).Before(wall) {
+			return first.In(time.Local)
+		}
+		t = start.Add(-time.Nanosecond)
+	}
+}
+
+// stamp is an instant reduced to what ordering needs. The loops that run over
+// every record compare stamps rather than time.Time values, whose Before the
+// compiler does not inline.
+type stamp struct {
+	sec  int64
+	nsec int32
+}
+
+func stampOf(t time.Time) stamp { return stamp{t.Unix(), int32(t.Nanosecond())} }
+
+func (s stamp) before(o stamp) bool {
+	return s.sec < o.sec || s.sec == o.sec && s.nsec < o.nsec
+}
+
+// daysBetween counts the calendar days from one date to another.
+func daysBetween(from, to time.Time) int {
+	return int(to.Sub(from) / (24 * time.Hour))
+}
+
+// weekStart is the Monday of date's ISO week.
+func weekStart(date time.Time) time.Time {
+	return date.AddDate(0, 0, -(int(date.Weekday())+6)%7)
+}
+
+func monthStart(date time.Time) time.Time {
+	return time.Date(date.Year(), date.Month(), 1, 0, 0, 0, 0, time.UTC)
+}
+
+// Day is the local midnight standing for t's date.
+func Day(t time.Time) time.Time {
+	return midnight(dateOf(t))
 }
 
 func StartOfISOWeek(t time.Time) time.Time {
-	d := Day(t)
-	wd := int(d.Weekday())
-	if wd == 0 {
-		wd = 7
-	}
-	return d.AddDate(0, 0, -(wd - 1))
+	return midnight(weekStart(dateOf(t)))
 }
 
 func StartOfMonth(t time.Time) time.Time {
-	d := Day(t)
-	return time.Date(d.Year(), d.Month(), 1, 0, 0, 0, 0, d.Location())
+	return midnight(monthStart(dateOf(t)))
 }
 
 // PeriodBounds is the window a period shows by default: enough history to see
 // a trend without turning the table into the full archive.
 func PeriodBounds(period Period, today time.Time) (since, until *time.Time) {
-	today = Day(today)
-	end := today
+	d := dateOf(today)
+	end := midnight(d)
 	until = &end
 	switch period {
 	case PeriodToday:
-		s := today
+		s := end
 		since = &s
 	case PeriodDay:
-		s := today.AddDate(0, 0, -13)
+		s := midnight(d.AddDate(0, 0, -13))
 		since = &s
 	case PeriodWeek:
-		s := StartOfISOWeek(today).AddDate(0, 0, -7*7)
+		s := midnight(weekStart(d).AddDate(0, 0, -7*7))
 		since = &s
 	case PeriodMonth:
-		s := StartOfMonth(today).AddDate(0, -11, 0)
+		s := midnight(monthStart(d).AddDate(0, -11, 0))
 		since = &s
 	default:
 		since = nil
@@ -104,34 +267,57 @@ func PeriodBounds(period Period, today time.Time) (since, until *time.Time) {
 	return since, until
 }
 
-// PrevBounds is the window immediately before the current one, used for the
-// period-over-period comparison on the summary cards.
-func PrevBounds(period Period, today time.Time) (since, until time.Time) {
-	today = Day(today)
+// PrevBounds is what a summary card compares the period so far with: as much
+// of the previous period as had passed of it by the same point, as the
+// instants [start, end). For today that is yesterday from midnight up to
+// now's clock time; for week, last week from Monday up to the same weekday and
+// time; for month, last month from the 1st up to the same day and time, or to
+// its end when it has no such day (on Mar 31 all of February counts); for
+// year, last year from Jan 1 up to the same date and time, Feb 29 likewise
+// counting all of last February. Anything else compares like today. Set
+// against the whole of the previous period, steady usage would look like a
+// collapse every Monday morning and on every 1st.
+//
+// The cut steps back by the calendar and keeps the clock time, rather than
+// stepping back a fixed duration, so a DST change in between cannot move it.
+func PrevBounds(period Period, now time.Time) (start, end time.Time) {
+	today := dateOf(now)
+	// A midnight that time.Date moved into the evening before still means the
+	// start of its day.
+	clock := max(reading(now).Sub(today), 0)
+	var from, cut time.Time
 	switch period {
-	case PeriodToday:
-		d := today.AddDate(0, 0, -1)
-		return d, d
 	case PeriodWeek:
-		s := StartOfISOWeek(today).AddDate(0, 0, -7)
-		return s, s.AddDate(0, 0, 6)
+		from = weekStart(today).AddDate(0, 0, -7)
+		cut = today.AddDate(0, 0, -7).Add(clock)
 	case PeriodMonth:
-		s := StartOfMonth(today).AddDate(0, -1, 0)
-		return s, s.AddDate(0, 1, -1)
+		from = monthStart(today).AddDate(0, -1, 0)
+		cut = sameDay(from, today.Day(), clock)
 	case PeriodYear:
-		s := time.Date(today.Year()-1, 1, 1, 0, 0, 0, 0, today.Location())
-		return s, time.Date(today.Year()-1, 12, 31, 0, 0, 0, 0, today.Location())
+		from = time.Date(today.Year()-1, 1, 1, 0, 0, 0, 0, time.UTC)
+		cut = sameDay(monthStart(today).AddDate(-1, 0, 0), today.Day(), clock)
 	default:
-		d := today.AddDate(0, 0, -1)
-		return d, d
+		from = today.AddDate(0, 0, -1)
+		cut = from.Add(clock)
 	}
+	return firstAt(from), firstAt(cut)
+}
+
+// sameDay is the given day and clock time in the month starting at first,
+// or, when that month is too short to have the day, the end of the month.
+func sameDay(first time.Time, day int, clock time.Duration) time.Time {
+	d := first.AddDate(0, 0, day-1)
+	if d.Month() != first.Month() {
+		return first.AddDate(0, 1, 0)
+	}
+	return d.Add(clock)
 }
 
 func BucketKey(period Period, t time.Time) (key, label string) {
-	d := Day(t)
+	d := civil(t)
 	switch period {
 	case PeriodWeek:
-		start := StartOfISOWeek(d)
+		start := weekStart(d)
 		end := start.AddDate(0, 0, 6)
 		y, w := d.ISOWeek()
 		key = fmt.Sprintf("%04d-W%02d", y, w)
@@ -367,22 +553,14 @@ func Heatmap(records []model.Usage) Heat {
 // Series is a per-day total covering an inclusive date range, with zero-filled
 // gaps so a sparkline keeps its horizontal scale honest.
 func Series(records []model.Usage, since, until time.Time) []int64 {
-	since, until = Day(since), Day(until)
-	if until.Before(since) {
-		return nil
-	}
-	days := int(until.Sub(since).Hours()/24) + 1
+	from := dateOf(since)
+	days := daysBetween(from, dateOf(until)) + 1
 	if days <= 0 || days > 4000 {
 		return nil
 	}
 	out := make([]int64, days)
 	for _, r := range records {
-		d := r.Date()
-		if d.Before(since) || d.After(until) {
-			continue
-		}
-		i := int(d.Sub(since).Hours() / 24)
-		if i >= 0 && i < days {
+		if i := daysBetween(from, civil(r.Time)); i >= 0 && i < days {
 			out[i] += r.Total()
 		}
 	}
@@ -396,46 +574,84 @@ type Snap struct {
 	Trend  []int64
 }
 
-// Snapshot computes the today/week/month/year cards, each with the previous
-// period's total and a daily trend to draw.
-func Snapshot(records []model.Usage, today time.Time) map[string]Snap {
-	today = Day(today)
-	weekStart := StartOfISOWeek(today)
-	monthStart := StartOfMonth(today)
-	yearStart := time.Date(today.Year(), 1, 1, 0, 0, 0, 0, today.Location())
+// trendDays is the longest trend a card draws, the year card's; every other
+// card's trend is its most recent days.
+const trendDays = 90
 
-	windows := []struct {
-		key          string
-		since, until time.Time
-		trendFrom    time.Time
+// Snapshot computes the today/week/month/year cards at the instant now. A
+// card's Totals cover its calendar span through today, so they agree with the
+// table for the same span; Prev is the stretch of the previous period that
+// PrevBounds describes; Trend is the daily series the card draws.
+//
+// The TUI recomputes the cards on every keystroke, so this is one pass over
+// the records that compares timestamps with instants worked out beforehand
+// and allocates nothing per record.
+func Snapshot(records []model.Usage, now time.Time) map[string]Snap {
+	today := dateOf(now)
+	trendStart := today.AddDate(0, 0, -(trendDays - 1))
+	cards := [...]struct {
+		key               string
+		since, trendSince time.Time // dates; the span and its trend run through today
+		from              stamp     // when the span begins
+		prevFrom, prevTo  stamp
+		totals, prev      model.Totals
 	}{
-		{"today", today, today, today.AddDate(0, 0, -13)},
-		{"week", weekStart, today, weekStart.AddDate(0, 0, -7)},
-		{"month", monthStart, today, monthStart},
-		{"year", yearStart, today, today.AddDate(0, 0, -89)},
+		{key: "today", since: today, trendSince: today.AddDate(0, 0, -13)},
+		{key: "week", since: weekStart(today), trendSince: weekStart(today).AddDate(0, 0, -7)},
+		{key: "month", since: monthStart(today), trendSince: monthStart(today)},
+		{key: "year", since: time.Date(today.Year(), 1, 1, 0, 0, 0, 0, time.UTC), trendSince: trendStart},
 	}
-	out := make(map[string]Snap, len(windows)+1)
-	for _, w := range windows {
-		var cur model.Totals
-		for _, r := range Filter(records, ptr(w.since), ptr(w.until)) {
-			cur.AddUsage(r)
+	// A record outside [earliest, end) counts towards all and nothing else.
+	end := stampOf(firstAt(today.AddDate(0, 0, 1))) // when today, and so every span, ends
+	trendFrom := stampOf(firstAt(trendStart))
+	earliest := trendFrom
+	for i := range cards {
+		c := &cards[i]
+		prevFrom, prevTo := PrevBounds(Period(c.key), now)
+		c.from, c.prevFrom, c.prevTo = stampOf(firstAt(c.since)), stampOf(prevFrom), stampOf(prevTo)
+		if c.from.before(earliest) {
+			earliest = c.from
 		}
-		ps, pu := PrevBounds(Period(w.key), today)
-		var prev model.Totals
-		for _, r := range Filter(records, &ps, &pu) {
-			prev.AddUsage(r)
+		if c.prevFrom.before(earliest) {
+			earliest = c.prevFrom
 		}
-		out[w.key] = Snap{Totals: cur, Prev: prev, Trend: Series(records, w.trendFrom, today)}
 	}
+
 	var all model.Totals
-	for _, r := range records {
-		all.AddUsage(r)
+	var daily [trendDays]int64 // oldest first, today last
+	for i := range records {
+		r := &records[i]
+		all.AddUsage(*r)
+		t := stampOf(r.Time)
+		if t.before(earliest) || !t.before(end) {
+			continue
+		}
+		for j := range cards {
+			c := &cards[j]
+			if !t.before(c.from) { // and before end, where every span stops
+				c.totals.AddUsage(*r)
+			}
+			if !t.before(c.prevFrom) && t.before(c.prevTo) {
+				c.prev.AddUsage(*r)
+			}
+		}
+		// Only the trends need a record's local date, and only within the
+		// days they cover.
+		if !t.before(trendFrom) {
+			if d := daysBetween(trendStart, civil(r.Time)); d >= 0 && d < trendDays {
+				daily[d] += r.Total()
+			}
+		}
+	}
+
+	out := make(map[string]Snap, len(cards)+1)
+	for _, c := range cards {
+		days := daysBetween(c.trendSince, today) + 1
+		out[c.key] = Snap{Totals: c.totals, Prev: c.prev, Trend: slices.Clone(daily[trendDays-days:])}
 	}
 	out["all"] = Snap{Totals: all}
 	return out
 }
-
-func ptr(t time.Time) *time.Time { return &t }
 
 func Sum(buckets []model.Bucket) model.Totals {
 	var t model.Totals
