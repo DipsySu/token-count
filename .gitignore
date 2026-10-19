@@ -1,0 +1,10 @@
+/tcount
+/token-count
+dist/
+build/
+*.exe
+.idea/
+.vscode/
+*.egg-info/
+__pycache__/
+.venv/

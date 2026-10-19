@@ -1,0 +1,2 @@
+{"timestamp":1787627755,"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"agent_thought_chunk"}}}
+{"timestamp":1787627800,"method":"session/update","params":{"sessionId":"s1","update":{"sessionUpdate":"turn_completed","usage":{"inputTokens":100,"outputTokens":10,"cachedReadTokens":80,"cacheCreationTokens":0,"reasoningTokens":4,"modelUsage":{"grok-4.6":{"inputTokens":100,"outputTokens":10,"cachedReadTokens":80,"cacheCreationTokens":0,"reasoningTokens":4}}}}}}
