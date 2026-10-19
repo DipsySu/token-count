@@ -26,6 +26,19 @@ type Options struct {
 	// the UI calls itself rather than a hardcoded name.
 	Name    string
 	Version string
+	// Now is the clock that decides what "today" is; nil means time.Now.
+	// Tests pin it so their answers do not depend on the day they run.
+	Now func() time.Time
+}
+
+// now reads the clock. Each computation reads it once and passes the instant
+// down rather than reading again: two readings either side of midnight would
+// describe two different days in one answer.
+func (o Options) now() time.Time {
+	if o.Now != nil {
+		return o.Now()
+	}
+	return time.Now()
 }
 
 type loadedMsg struct {
@@ -78,6 +91,13 @@ type Model struct {
 	snapshot map[string]aggregate.Snap
 	heat     aggregate.Heat
 	open     map[string]bool
+
+	// asOf is the instant the figures on screen were computed against, and
+	// since/until the window it gave the table (nil leaves a side open).
+	// Rendering reads these instead of the clock, so everything drawn
+	// describes the same moment.
+	asOf         time.Time
+	since, until *time.Time
 
 	sort    sortKey
 	search  string
@@ -390,15 +410,86 @@ func (m *Model) setAllOpen(v bool) {
 	m.clamp()
 }
 
-// scope narrows the full record set to what the current period, agent filter,
-// explicit date flags and search term select.
-func (m *Model) scope() []model.Usage {
-	recs := aggregate.FilterAgent(m.records, m.agent)
-	if m.opts.Since != nil || m.opts.Until != nil {
-		recs = aggregate.Filter(recs, m.opts.Since, m.opts.Until)
-	} else if since, until := aggregate.PeriodBounds(m.period, time.Now()); since != nil || until != nil {
-		recs = aggregate.Filter(recs, since, until)
+// window is the date range a request covers: the explicit --since/--until
+// dates when either is given, otherwise the span's default bounds as of now.
+// It is the only definition of scope. The TUI and every export narrow through
+// it, so the rows, the heat grid, the call count and the record count can
+// never describe different windows.
+func window(opts Options, period aggregate.Period, now time.Time) (since, until *time.Time) {
+	if opts.Since != nil || opts.Until != nil {
+		return opts.Since, opts.Until
 	}
+	return aggregate.PeriodBounds(period, now)
+}
+
+// windowDates names the first and last calendar dates a window admits, as
+// YYYY-MM-DD; an open side is "". Anything that prints a window should use
+// it, because formatting a bound names the wrong day in some zones. A bound
+// is the instant time.Date gives for a local midnight, and where a DST change
+// skips midnight time.Date moves it into the evening before: Santiago's
+// clocks jump from 00:00 to 01:00 on 6 September 2026, so the bound standing
+// for the 6th is 23:00 on the 5th.
+//
+// The dates are the ones aggregate.Filter admits: since admits the dates
+// whose midnight is not before it, and until those whose midnight is not
+// after it.
+func windowDates(since, until *time.Time) (first, last string) {
+	const layout = "2006-01-02"
+	if since != nil {
+		d := civilDate(*since)
+		for localMidnight(d).Before(*since) {
+			d = d.AddDate(0, 0, 1)
+		}
+		first = d.Format(layout)
+	}
+	if until != nil {
+		// The bound can stand for the day after its own, when that day's
+		// midnight was moved back into this one.
+		d := civilDate(*until).AddDate(0, 0, 1)
+		for localMidnight(d).After(*until) {
+			d = d.AddDate(0, 0, -1)
+		}
+		last = d.Format(layout)
+	}
+	return first, last
+}
+
+// civilDate is t's local calendar date, held as midnight UTC, where stepping
+// a day is exact.
+func civilDate(t time.Time) time.Time {
+	y, m, d := t.In(time.Local).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, time.UTC)
+}
+
+// localMidnight is the instant that stands for a calendar date wherever the
+// aggregate package takes one: what time.Date gives for its local midnight.
+func localMidnight(date time.Time) time.Time {
+	return time.Date(date.Year(), date.Month(), date.Day(), 0, 0, 0, 0, time.Local)
+}
+
+// group arranges records that are already in scope into the table's rows.
+// The heat view's answer is its grid, so it falls through to the time
+// grouping: a report still carries rows for it whose totals match the grid.
+func group(recs []model.Usage, view aggregate.View, period aggregate.Period, byModel bool) []model.Bucket {
+	switch view {
+	case aggregate.ViewProject:
+		return aggregate.GroupProject(recs)
+	case aggregate.ViewModel:
+		return aggregate.GroupModel(recs)
+	}
+	switch period {
+	case aggregate.PeriodToday:
+		return aggregate.GroupAgent(recs, byModel)
+	case aggregate.PeriodAll:
+		period = aggregate.PeriodDay
+	}
+	return aggregate.GroupTime(recs, period, byModel)
+}
+
+// scope narrows the full record set to what the agent filter, the current
+// window and the search term select.
+func (m *Model) scope() []model.Usage {
+	recs := aggregate.Filter(aggregate.FilterAgent(m.records, m.agent), m.since, m.until)
 	if q := strings.ToLower(strings.TrimSpace(m.search)); q != "" {
 		out := recs[:0:0]
 		for _, r := range recs {
@@ -414,34 +505,26 @@ func (m *Model) scope() []model.Usage {
 }
 
 func (m *Model) recompute() {
+	// The clock is read once, and the cards, the window and the title bar
+	// all use that one instant even if the recompute runs across midnight.
+	m.asOf = m.opts.now()
+
 	// Cards always describe the unfiltered-by-period picture so they stay a
 	// stable reference while the table below changes shape.
 	base := aggregate.FilterAgent(m.records, m.agent)
 	if m.opts.Since != nil || m.opts.Until != nil {
 		base = aggregate.Filter(base, m.opts.Since, m.opts.Until)
 	}
-	m.snapshot = aggregate.Snapshot(base, time.Now())
+	m.snapshot = aggregate.Snapshot(base, m.asOf)
 
+	m.since, m.until = window(m.opts, m.period, m.asOf)
 	m.scoped = m.scope()
 
-	switch m.view {
-	case aggregate.ViewProject:
-		m.rows = aggregate.GroupProject(m.scoped)
-	case aggregate.ViewModel:
-		m.rows = aggregate.GroupModel(m.scoped)
-	case aggregate.ViewHeat:
+	if m.view == aggregate.ViewHeat {
 		m.heat = aggregate.Heatmap(m.scoped)
 		m.rows = nil
-	default:
-		if m.period == aggregate.PeriodToday {
-			m.rows = aggregate.GroupAgent(m.scoped, m.byModel)
-		} else {
-			p := m.period
-			if p == aggregate.PeriodAll {
-				p = aggregate.PeriodDay
-			}
-			m.rows = aggregate.GroupTime(m.scoped, p, m.byModel)
-		}
+	} else {
+		m.rows = group(m.scoped, m.view, m.period, m.byModel)
 	}
 	m.applySort()
 	m.flat = aggregate.Flatten(m.rows, m.open)

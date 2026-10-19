@@ -39,7 +39,7 @@ func TestDumpEmpty(t *testing.T) {
 	}
 	withFancy(t, true)
 	for _, c := range cases {
-		m := newTestModel(100, 24)
+		m := newTestModel(t, 100, 24)
 		m.records = nil
 		c.setup(&m)
 		m.recompute()

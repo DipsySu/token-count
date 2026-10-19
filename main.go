@@ -18,6 +18,10 @@ var version = "0.3.0"
 // defaultName is what to call ourselves when argv[0] is unusable.
 const defaultName = "tcount"
 
+// clock decides what "today" is. Tests pin it so that a run's answer does not
+// depend on the day it happens to execute.
+var clock = time.Now
+
 func main() {
 	if err := run(invokedName(os.Args[0]), os.Args[1:]); err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -133,6 +137,7 @@ func run(name string, args []string) error {
 		NoCat:   *noCat,
 		Name:    name,
 		Version: version,
+		Now:     clock,
 	}
 
 	if ui.ShouldTUI(*plain, *asJSON) {
@@ -143,15 +148,18 @@ func run(name string, args []string) error {
 	if err != nil {
 		return err
 	}
-	if view == aggregate.ViewHeat && !*asJSON {
-		ui.WriteHeat(os.Stdout, records, opts)
-		return nil
+	// Every output format is drawn from one export, built against one reading
+	// of the clock, so none of them can disagree about the window it
+	// describes. The heatmap prints only the records in that window, so it
+	// skips the rows and the summary cards the other formats need.
+	switch {
+	case *asJSON:
+		return ui.WriteJSON(os.Stdout, opts, ui.BuildExport(records, opts), stats)
+	case view == aggregate.ViewHeat:
+		ui.WriteHeat(os.Stdout, ui.ScopeExport(records, opts))
+	default:
+		ui.WritePlain(os.Stdout, opts, ui.BuildExport(records, opts), stats)
 	}
-	buckets, snap := ui.BuildBuckets(records, opts)
-	if *asJSON {
-		return ui.WriteJSON(os.Stdout, opts, records, buckets, snap, stats)
-	}
-	ui.WritePlain(os.Stdout, opts, buckets, snap, stats)
 	return nil
 }
 

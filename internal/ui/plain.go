@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"golang.org/x/term"
 
 	"token-count/internal/aggregate"
@@ -26,18 +27,25 @@ func ShouldTUI(plain, asJSON bool) bool {
 	return term.IsTerminal(int(os.Stdout.Fd()))
 }
 
+// Report is the --json output. Since and Until are the first and last local
+// calendar dates that the rows, the heat grid, Records and Calls all cover,
+// whether the window came from explicit dates or from the span; a side with
+// no bound is omitted. UTCOffset is the local offset at Date, when the report
+// was made. A window that crosses a daylight-saving change began under a
+// different offset, so it is not the offset of every date in the window.
 type Report struct {
-	Period  string               `json:"period"`
-	View    string               `json:"view"`
-	Heat    *ReportHeat          `json:"heat,omitempty"`
-	Date    string               `json:"date,omitempty"`
-	Since   *string              `json:"since,omitempty"`
-	Until   *string              `json:"until,omitempty"`
-	Rows    []ReportRow          `json:"rows"`
-	Snap    map[string]ReportSum `json:"snapshot,omitempty"`
-	Records int                  `json:"records"`
-	Calls   int64                `json:"calls"`
-	Deduped ReportDedup          `json:"deduped"`
+	Period    string               `json:"period"`
+	View      string               `json:"view"`
+	Heat      *ReportHeat          `json:"heat,omitempty"`
+	Date      string               `json:"date,omitempty"`
+	Since     *string              `json:"since,omitempty"`
+	Until     *string              `json:"until,omitempty"`
+	UTCOffset string               `json:"utc_offset"`
+	Rows      []ReportRow          `json:"rows"`
+	Snap      map[string]ReportSum `json:"snapshot,omitempty"`
+	Records   int                  `json:"records"`
+	Calls     int64                `json:"calls"`
+	Deduped   ReportDedup          `json:"deduped"`
 }
 
 // ReportHeat is the hour-of-week grid, emitted only for the heat view. Rows
@@ -90,45 +98,49 @@ func Load(opts Options) ([]model.Usage, source.Stats, error) {
 	return recs, stats, err
 }
 
-// BuildBuckets applies the same scoping and grouping the TUI uses, so the two
-// front ends can never disagree about what a period means.
-func BuildBuckets(records []model.Usage, opts Options) ([]model.Bucket, map[string]aggregate.Snap) {
-	today := aggregate.Day(time.Now())
+// Export is one non-interactive answer: the window a request covers, the
+// records inside it and the rows they group into, all computed from a single
+// reading of the clock. Every printed or encoded figure is derived from it, so
+// the header date, the rows, the heat grid and the counts always agree.
+type Export struct {
+	Now     time.Time
+	Since   *time.Time // the effective window; nil leaves that side open
+	Until   *time.Time
+	Records []model.Usage // only the records inside the window
+	// Rows and Snap are left empty by ScopeExport; BuildExport fills them.
+	Rows []model.Bucket
+	Snap map[string]aggregate.Snap
+}
+
+// ScopeExport fixes what an export covers, from one reading of the clock: the
+// window and the records inside it. That is all the heatmap prints, so it
+// stops there rather than paying for rows and summary cards nobody sees.
+func ScopeExport(records []model.Usage, opts Options) Export {
+	now := opts.now()
+	since, until := window(opts, opts.Period, now)
+	return Export{
+		Now:     now,
+		Since:   since,
+		Until:   until,
+		Records: aggregate.Filter(records, since, until),
+	}
+}
+
+// BuildExport completes ScopeExport with the rows and the summary cards that
+// the table and the JSON report print. It applies the same window and
+// grouping the TUI uses, so the two front ends can never disagree about what
+// a period means.
+func BuildExport(records []model.Usage, opts Options) Export {
+	ex := ScopeExport(records, opts)
+	ex.Rows = group(ex.Records, opts.View, opts.Period, opts.ByModel)
+
+	// The cards ignore the span, exactly as in the TUI, but not explicit dates.
 	base := records
 	if opts.Since != nil || opts.Until != nil {
 		base = aggregate.Filter(base, opts.Since, opts.Until)
 	}
-	snap := aggregate.Snapshot(base, today)
-
-	recs := base
-	view := opts.View
-	if view == "" {
-		view = aggregate.ViewTime
-	}
-	if opts.Since == nil && opts.Until == nil && view != aggregate.ViewHeat {
-		if since, until := aggregate.PeriodBounds(opts.Period, today); since != nil || until != nil {
-			recs = aggregate.Filter(recs, since, until)
-		}
-	}
-
-	var buckets []model.Bucket
-	switch view {
-	case aggregate.ViewProject:
-		buckets = aggregate.GroupProject(recs)
-	case aggregate.ViewModel:
-		buckets = aggregate.GroupModel(recs)
-	default:
-		if opts.Period == aggregate.PeriodToday {
-			buckets = aggregate.GroupAgent(recs, opts.ByModel)
-		} else {
-			p := opts.Period
-			if p == aggregate.PeriodAll {
-				p = aggregate.PeriodDay
-			}
-			buckets = aggregate.GroupTime(recs, p, opts.ByModel)
-		}
-	}
-	return buckets, snap
+	ex.Snap = aggregate.Snapshot(base, ex.Now)
+	return ex
 }
 
 func toReportSum(t model.Totals) ReportSum {
@@ -165,25 +177,18 @@ func toReportRow(b model.Bucket) ReportRow {
 	return r
 }
 
-func WriteJSON(w io.Writer, opts Options, records []model.Usage, buckets []model.Bucket, snap map[string]aggregate.Snap, stats source.Stats) error {
-	rows := make([]ReportRow, 0, len(buckets))
+// WriteJSON encodes the --json report. It needs the rows and the summary
+// cards, so ex has to come from BuildExport.
+func WriteJSON(w io.Writer, opts Options, ex Export, stats source.Stats) error {
+	rows := make([]ReportRow, 0, len(ex.Rows))
 	var calls int64
-	for _, b := range buckets {
+	for _, b := range ex.Rows {
 		rows = append(rows, toReportRow(b))
 		calls += b.Totals.Calls
 	}
-	snapOut := make(map[string]ReportSum, len(snap))
-	for k, v := range snap {
+	snapOut := make(map[string]ReportSum, len(ex.Snap))
+	for k, v := range ex.Snap {
 		snapOut[k] = toReportSum(v.Totals)
-	}
-	var sinceS, untilS *string
-	if opts.Since != nil {
-		s := opts.Since.Format("2006-01-02")
-		sinceS = &s
-	}
-	if opts.Until != nil {
-		s := opts.Until.Format("2006-01-02")
-		untilS = &s
 	}
 	view := string(opts.View)
 	if view == "" {
@@ -193,71 +198,92 @@ func WriteJSON(w io.Writer, opts Options, records []model.Usage, buckets []model
 	// labelling day-grouped rows as a heatmap.
 	var heat *ReportHeat
 	if opts.View == aggregate.ViewHeat {
-		h := aggregate.Heatmap(scopeForHeat(records, opts))
+		h := aggregate.Heatmap(ex.Records)
 		heat = &ReportHeat{Cells: h.Cells, Min: h.Min, Max: h.Max, Total: h.Total}
 	}
+	now := ex.Now.In(time.Local)
+	since, until := windowDates(ex.Since, ex.Until)
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	return enc.Encode(Report{
-		Period:  string(opts.Period),
-		View:    view,
-		Heat:    heat,
-		Date:    time.Now().Format("2006-01-02"),
-		Since:   sinceS,
-		Until:   untilS,
-		Rows:    rows,
-		Snap:    snapOut,
-		Records: len(records),
-		Calls:   calls,
-		Deduped: ReportDedup{Dropped: stats.Dropped, DroppedTokens: stats.DroppedTokens},
+		Period:    string(opts.Period),
+		View:      view,
+		Heat:      heat,
+		Date:      now.Format("2006-01-02"),
+		Since:     optional(since),
+		Until:     optional(until),
+		UTCOffset: now.Format("-07:00"),
+		Rows:      rows,
+		Snap:      snapOut,
+		Records:   len(ex.Records),
+		Calls:     calls,
+		Deduped:   ReportDedup{Dropped: stats.Dropped, DroppedTokens: stats.DroppedTokens},
 	})
 }
 
-// WritePlain prints the same table the TUI shows, without the chrome, by
-// driving the shared renderer with every group expanded.
-func WritePlain(w io.Writer, opts Options, buckets []model.Bucket, snap map[string]aggregate.Snap, stats source.Stats) {
-	st := newStyles()
-	width := 100
+// optional is a field that is left out of the report when it is empty, as an
+// open side of the window is.
+func optional(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
+}
+
+// exportWidth is the table width for a text export: the terminal's when
+// stdout is one, otherwise a fixed width that suits a file or a pipe. It is a
+// variable so the tests can pin it, since a test binary run by hand prints to
+// a terminal.
+var exportWidth = func() int {
 	if term.IsTerminal(int(os.Stdout.Fd())) {
 		if got, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && got > 40 {
-			width = got
+			return got
 		}
 	}
+	return 100
+}
+
+// WritePlain prints the same table the TUI shows, without the chrome, by
+// driving the shared renderer with every group expanded and every row drawn.
+// Like WriteJSON, it needs an export from BuildExport.
+func WritePlain(w io.Writer, opts Options, ex Export, stats source.Stats) {
+	st := newStyles()
+	width := exportWidth()
 
 	view := opts.View
 	if view == "" {
 		view = aggregate.ViewTime
 	}
 	fmt.Fprintln(w, st.Title.Render(displayName(opts.Name))+
-		st.Muted.Render("  ·  "+string(opts.Period)+"  ·  "+string(view)+"  ·  "+time.Now().Format("2006-01-02")))
+		st.Muted.Render("  ·  "+string(opts.Period)+"  ·  "+string(view)+"  ·  "+ex.Now.In(time.Local).Format("2006-01-02")))
 	fmt.Fprintln(w)
 
 	var parts []string
 	for _, key := range []string{"today", "week", "month", "year"} {
-		t := snap[key].Totals
+		t := ex.Snap[key].Totals
 		parts = append(parts, st.Faint.Render(strings.ToUpper(key)+" ")+st.Total.Render(model.FmtTokens(t.Total())))
 	}
 	fmt.Fprintln(w, " "+strings.Join(parts, "    "))
 	fmt.Fprintln(w)
 
 	open := map[string]bool{}
-	for _, b := range buckets {
+	for _, b := range ex.Rows {
 		if len(b.Children) > 0 {
 			open[b.Key] = true
 		}
 	}
 	m := Model{
-		opts:   opts,
-		period: opts.Period,
-		view:   view,
-		rows:   buckets,
-		flat:   aggregate.Flatten(buckets, open),
-		open:   open,
-		width:  width,
-		height: 1000,
-		cursor: -1,
+		opts:    opts,
+		period:  opts.Period,
+		view:    view,
+		byModel: opts.ByModel,
+		rows:    ex.Rows,
+		flat:    aggregate.Flatten(ex.Rows, open),
+		open:    open,
+		width:   width,
+		cursor:  -1,
 	}
-	for _, line := range m.tableView(width, st) {
+	for _, line := range m.renderTable(width, st, 0, len(m.flat)) {
 		if strings.TrimSpace(stripANSI(line)) == "" {
 			continue
 		}
@@ -274,42 +300,18 @@ func WritePlain(w io.Writer, opts Options, buckets []model.Bucket, snap map[stri
 }
 
 // stripANSI removes escape sequences so blank-line detection is not fooled by
-// styling on an otherwise empty row.
-func stripANSI(s string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] == 0x1b {
-			for i < len(s) && s[i] != 'm' {
-				i++
-			}
-			continue
-		}
-		b.WriteByte(s[i])
-	}
-	return b.String()
-}
+// styling on an otherwise empty row. It parses them properly rather than
+// skipping to the next 'm', which would swallow text after any sequence that
+// does not end in one.
+func stripANSI(s string) string { return ansi.Strip(s) }
 
-// scopeForHeat narrows records the same way the TUI does before building the
-// grid, so both front ends describe the same window.
-func scopeForHeat(records []model.Usage, opts Options) []model.Usage {
-	if opts.Since != nil || opts.Until != nil {
-		return aggregate.Filter(records, opts.Since, opts.Until)
-	}
-	if since, until := aggregate.PeriodBounds(opts.Period, time.Now()); since != nil || until != nil {
-		return aggregate.Filter(records, since, until)
-	}
-	return records
-}
-
-func WriteHeat(w io.Writer, records []model.Usage, opts Options) {
+// WriteHeat prints the hour-of-week grid for the export's window, the same
+// records its rows and counts are drawn from. It reads only the records, so
+// an export from ScopeExport is enough.
+func WriteHeat(w io.Writer, ex Export) {
 	st := newStyles()
-	width := 100
-	if term.IsTerminal(int(os.Stdout.Fd())) {
-		if got, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && got > 40 {
-			width = got
-		}
-	}
-	m := Model{heat: aggregate.Heatmap(scopeForHeat(records, opts)), width: width, height: 40}
+	width := exportWidth()
+	m := Model{heat: aggregate.Heatmap(ex.Records), width: width}
 	for _, line := range m.heatView(width, st) {
 		fmt.Fprintln(w, line)
 	}

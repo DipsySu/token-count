@@ -4,6 +4,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -31,14 +32,16 @@ func allPoses() map[string][]string {
 }
 
 // Every line must measure exactly catWidth, or the summary cards beside the
-// mascot shift out of alignment.
+// mascot shift out of alignment. It is measured the way the layout measures,
+// not by runewidth's default, which follows the locale and would count the
+// East Asian ambiguous glyphs as two cells under a CJK one.
 func TestCatLinesAreExactlyCatWidth(t *testing.T) {
 	for name, art := range allPoses() {
 		if len(art) != 4 {
 			t.Fatalf("%s: %d lines, want 4", name, len(art))
 		}
 		for i, ln := range art {
-			if got := runewidth.StringWidth(ln); got != catWidth {
+			if got := ansi.StringWidth(ln); got != catWidth {
 				t.Errorf("%s line %d measures %d, want %d: %q", name, i, got, catWidth, ln)
 			}
 		}

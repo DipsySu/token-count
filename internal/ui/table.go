@@ -57,8 +57,11 @@ func (m Model) columns() []col {
 		{"AVG", 7, true, prioLow, "avg"},
 	}
 	if m.byModel && m.view == aggregate.ViewTime {
+		// Split by model, an agent's rows differ only in their model, so the
+		// column is as essential as the name: without it they read as
+		// identical lines.
 		cols = append(cols[:1],
-			append([]col{{"MODEL", 18, false, prioMedium, "model"}}, cols[1:]...)...)
+			append([]col{{"MODEL", 18, false, prioEssential, "model"}}, cols[1:]...)...)
 	}
 	return cols
 }
@@ -85,12 +88,14 @@ func fitColumns(cols []col, width int) []col {
 		}
 		out = kept
 	}
-	// Still too wide: shrink the name column before giving up on a column.
-	if t := total(out); t > width && len(out) > 0 && out[0].id == "name" {
-		if shrink := t - width; out[0].width-shrink >= 8 {
-			out[0].width -= shrink
-		} else {
-			out[0].width = 8
+	// Still too wide: shrink the text columns, the name before the model,
+	// before giving up on a column. Neither goes below 8 cells.
+	for i := range out {
+		if out[i].id != "name" && out[i].id != "model" {
+			continue
+		}
+		if over := total(out) - width; over > 0 {
+			out[i].width = max(8, out[i].width-over)
 		}
 	}
 	if slack := width - total(out); slack > 0 {
@@ -127,7 +132,19 @@ func colWidth(cols []col, id string) int {
 	return 0
 }
 
+// tableView is the table as the TUI shows it: the screenful of rows that fits
+// between the chrome, scrolled to keep the cursor in view.
 func (m Model) tableView(width int, st Styles) []string {
+	end := min(m.offset+m.bodyRows(), len(m.flat))
+	return m.renderTable(width, st, min(m.offset, end), end)
+}
+
+// renderTable draws the column header, rows [start, end) of the flattened
+// table, and the total. The total always sums every row, so which rows are
+// drawn is the caller's explicit choice: the TUI passes one screenful, while a
+// text export passes all of them. An export that stopped at some screen
+// height while its TOTAL still counted everything would be silently wrong.
+func (m Model) renderTable(width int, st Styles, start, end int) []string {
 	cols := fitColumns(m.columns(), width)
 
 	head := make([]string, 0, len(cols))
@@ -156,10 +173,6 @@ func (m Model) tableView(width int, st Styles) []string {
 			scale = b.Totals.Total()
 		}
 	}
-
-	vis := m.bodyRows()
-	start := m.offset
-	end := min(start+vis, len(m.flat))
 
 	for i := start; i < end; i++ {
 		out = append(out, m.renderRow(m.flat[i], cols, scale, st, i == m.cursor))
@@ -191,9 +204,10 @@ func (m Model) emptyState(width int, st Styles) []string {
 	}
 
 	if !m.cat || !fancyEnabled() || width < 44 {
-		out := []string{"", st.Faint.Render("   " + reason)}
+		// The reason quotes the search term, which can be any length.
+		out := []string{"", st.Faint.Render(truncate("   "+reason, width))}
 		if hint != "" {
-			out = append(out, st.Faint.Render("   "+hint))
+			out = append(out, st.Faint.Render(truncate("   "+hint, width)))
 		}
 		return out
 	}
@@ -212,8 +226,9 @@ func (m Model) emptyState(width int, st Styles) []string {
 	return out
 }
 
-// renderRow draws one row. Selection is applied per cell so that the styled
-// agent colours and bar survive the highlight instead of being overwritten.
+// renderRow draws one row. A selected row's highlight is laid under its
+// cells, so the agent colours and the bar keep their own colours on top of
+// it instead of being overwritten.
 func (m Model) renderRow(b model.Bucket, cols []col, scale int64, st Styles, selected bool) string {
 	t := b.Totals
 	cells := make([]string, 0, len(cols))
@@ -260,7 +275,7 @@ func (m Model) renderRow(b model.Bucket, cols []col, scale int64, st Styles, sel
 
 	line := " " + strings.Join(cells, " ")
 	if selected {
-		return st.Sel.Render(padRight(line, m.width))
+		return underlay(padRight(line, m.width), st.Sel)
 	}
 	return line
 }
@@ -340,7 +355,9 @@ func (m Model) totalRow(cols []col, st Styles, width int) string {
 			cells = append(cells, strings.Repeat(" ", c.width))
 		}
 	}
-	return st.Total.Render(padRight(" "+strings.Join(cells, " "), width))
+	// The cache rate can carry a colour of its own; underlay keeps the row
+	// bold after it.
+	return underlay(padRight(" "+strings.Join(cells, " "), width), st.Total)
 }
 
 func renderBar(n, scale int64, width int, st Styles) string {
@@ -416,12 +433,12 @@ func (m Model) heatView(width int, st Styles) []string {
 	out = append(out, "")
 	peakD, peakH := m.heatPeak()
 	if m.heat.Total > 0 {
-		out = append(out, st.Faint.Render(
+		out = append(out, st.Faint.Render(truncate(
 			"  peak  "+days[peakD]+" "+itoa2(peakH)+":00   "+
 				model.FmtTokens(m.heat.Cells[peakD][peakH])+
-				"   total "+model.FmtTokens(m.heat.Total)))
+				"   total "+model.FmtTokens(m.heat.Total), width)))
 	} else {
-		out = append(out, st.Faint.Render("  nothing recorded in this range"))
+		out = append(out, st.Faint.Render(truncate("  nothing recorded in this range", width)))
 	}
 	return out
 }

@@ -1,11 +1,12 @@
 package ui
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
-	"github.com/mattn/go-runewidth"
+	"github.com/charmbracelet/x/ansi"
 
 	"token-count/internal/aggregate"
 	"token-count/internal/model"
@@ -13,20 +14,38 @@ import (
 
 const detailHeight = 6
 
+// minWidth and minHeight are the smallest terminal the layout is drawn for.
+const (
+	minWidth  = 30
+	minHeight = 10
+)
+
 func (m Model) View() string {
 	w, h := m.width, m.height
-	if w < 30 {
-		w = 80
-	}
-	if h < 10 {
-		h = 24
-	}
 	st := newStyles()
+	if w < minWidth || h < minHeight {
+		return tooSmall(w, h, st)
+	}
 	lines := strings.Split(m.helpOrBody(w, h, st), "\n")
 	for len(lines) < h {
 		lines = append(lines, "")
 	}
 	return strings.Join(lines[:h], "\n")
+}
+
+// tooSmall stands in for the layout on a terminal smaller than it is drawn
+// for. Drawing the frame at the minimum size anyway would not help: the
+// terminal cuts whatever does not fit, keeping the left columns and the
+// bottom rows, so the totals and the title would be the first things lost.
+func tooSmall(w, h int, st Styles) string {
+	note := []string{
+		st.Warn.Render(truncate("terminal too small", w)),
+		st.Faint.Render(truncate(fmt.Sprintf("need %dx%d", minWidth, minHeight), w)),
+	}
+	if h < len(note) {
+		note = note[:max(h, 0)]
+	}
+	return lipgloss.Place(w, h, lipgloss.Center, lipgloss.Center, strings.Join(note, "\n"))
 }
 
 func (m Model) helpOrBody(w, h int, st Styles) string {
@@ -83,7 +102,15 @@ func (m Model) titleBar(w int, st Styles) string {
 	if m.opts.Version != "" {
 		left += st.Version.Render(" v" + m.opts.Version)
 	}
-	right := st.Muted.Render(time.Now().Format("2006-01-02 15:04") + " ")
+	// The stamp is the instant the figures were computed against, not a live
+	// clock: after midnight a live clock would show a date the cards below no
+	// longer describe. Before the first computation there are no figures to
+	// date, so the scan screen shows the current time.
+	at := m.asOf
+	if at.IsZero() {
+		at = m.opts.now()
+	}
+	right := st.Muted.Render(at.In(time.Local).Format("2006-01-02 15:04") + " ")
 	return joinLR(left, right, w)
 }
 
@@ -345,9 +372,9 @@ func (m Model) loadingBody(w, h int, st Styles) []string {
 		}
 	} else {
 		out = []string{
-			st.Dim.Render("  " + frame + "  scanning session logs"),
+			st.Dim.Render(truncate("  "+frame+"  scanning session logs", w)),
 			"",
-			st.Faint.Render("     ~/.claude  ~/.codex  ~/.grok  ~/.gemini  ~/.local/share/opencode"),
+			st.Faint.Render(truncate("     ~/.claude  ~/.codex  ~/.grok  ~/.gemini  ~/.local/share/opencode", w)),
 		}
 	}
 	for len(out) < h {
@@ -488,6 +515,11 @@ func (m Model) helpView(w, h int, st Styles) string {
 	if len(lines) > h {
 		lines = lines[:h]
 	}
+	// The two columns need 42 cells; a narrower terminal clips them rather
+	// than letting a line wrap and push the screen out of shape.
+	for i := range lines {
+		lines[i] = truncate(lines[i], w)
+	}
 	for len(lines) < h {
 		lines = append(lines, "")
 	}
@@ -495,10 +527,16 @@ func (m Model) helpView(w, h int, st Styles) string {
 }
 
 // --- layout helpers -------------------------------------------------------
+//
+// Everything below takes strings that may already be styled. Widths are
+// measured, and strings cut, with the same ANSI-aware rules from x/ansi:
+// counting escape bytes as cells cuts a styled string far too early, and a cut
+// that lands inside a styled run drops its reset, so the colour bleeds into
+// whatever is printed next.
 
 func joinLR(left, right string, width int) string {
-	lw := lipgloss.Width(left)
-	rw := lipgloss.Width(right)
+	lw := ansi.StringWidth(left)
+	rw := ansi.StringWidth(right)
 	if space := width - lw - rw; space >= 1 {
 		return left + strings.Repeat(" ", space) + right
 	}
@@ -508,14 +546,16 @@ func joinLR(left, right string, width int) string {
 	return left // right side does not fit; drop it rather than overflow
 }
 
+// truncate cuts s to at most width cells, marking the cut with an ellipsis.
+// Escape sequences past the cut are kept, so every style is still closed.
 func truncate(s string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if lipgloss.Width(s) <= width {
+	if ansi.StringWidth(s) <= width {
 		return s
 	}
-	return runewidth.Truncate(s, width, "…")
+	return ansi.Truncate(s, width, "…")
 }
 
 // truncateLeft drops leading characters instead of trailing ones. Paths are
@@ -524,35 +564,66 @@ func truncateLeft(s string, width int) string {
 	if width <= 0 {
 		return ""
 	}
-	if runewidth.StringWidth(s) <= width {
+	sw := ansi.StringWidth(s)
+	if sw <= width {
 		return s
 	}
-	r := []rune(s)
-	for i := range r {
-		cand := string(r[i:])
-		if runewidth.StringWidth(cand)+1 <= width {
-			return "…" + cand
+	// Drop just enough leading cells to leave room for the ellipsis. A wide
+	// character straddling the cut is kept whole, which can leave the result
+	// a cell too wide, so drop one more cell until it fits. Only when no part
+	// of the tail fits beside the ellipsis, as at width 1, is the string cut
+	// from the right instead.
+	for drop := sw - width + 1; drop < sw; drop++ {
+		if out := ansi.TruncateLeft(s, drop, "…"); ansi.StringWidth(out) <= width {
+			return out
 		}
 	}
-	return runewidth.Truncate(s, width, "…")
+	return ansi.Truncate(s, width, "…")
 }
 
-// padRight pads a possibly styled string to width without disturbing its
-// escape sequences.
+// padRight fits a possibly styled string to exactly width cells without
+// disturbing its escape sequences.
 func padRight(s string, width int) string {
-	w := lipgloss.Width(s)
-	if w >= width {
-		return truncate(s, width)
+	s, w := fit(s, width)
+	if w < width {
+		s += strings.Repeat(" ", width-w)
 	}
-	return s + strings.Repeat(" ", width-w)
+	return s
 }
 
 func padLeft(s string, width int) string {
-	w := lipgloss.Width(s)
-	if w >= width {
-		return truncate(s, width)
+	s, w := fit(s, width)
+	if w < width {
+		s = strings.Repeat(" ", width-w) + s
 	}
-	return strings.Repeat(" ", width-w) + s
+	return s
+}
+
+// fit truncates s to width when it is wider and reports the width it ends up
+// with. That can be a cell short of width when a double-width character
+// straddles the cut, which is why the padding helpers measure after cutting.
+func fit(s string, width int) (string, int) {
+	w := ansi.StringWidth(s)
+	if w > width {
+		s = truncate(s, width)
+		w = ansi.StringWidth(s)
+	}
+	return s, w
+}
+
+// sgrReset is how termenv, under lipgloss, closes every style it renders.
+const sgrReset = "\x1b[0m"
+
+// underlay styles a line whose cells already carry styles of their own.
+// Wrapping the line once is not enough: the reset that closes each styled
+// cell closes the outer style too, so a highlight would stop at the first
+// coloured cell. The outer style is reopened after every reset instead, and
+// each cell's own colour still shows on top of it.
+func underlay(line string, style lipgloss.Style) string {
+	if open, _, ok := strings.Cut(style.Render("x"), "x"); ok && open != "" {
+		line = strings.ReplaceAll(line, sgrReset, sgrReset+open)
+	}
+	return style.Render(line)
 }
 
 func padCol(s string, width int, right bool) string {

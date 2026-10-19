@@ -13,9 +13,40 @@ import (
 	"token-count/internal/model"
 )
 
-func sample() []model.Usage {
+// testZone stands in for the local zone during tests. It has no daylight
+// saving, so no test can straddle a clock change, and pinning it means day
+// boundaries do not depend on the TZ the suite happens to run under.
+var testZone = time.FixedZone("UTC+8", 8*3600)
+
+// testNow is the instant the tests treat as now: a Tuesday afternoon, so
+// records stamped that morning are already part of today.
+var testNow = time.Date(2026, 8, 25, 15, 0, 0, 0, testZone)
+
+func testClock() time.Time { return testNow }
+
+// pinLocal makes testZone the local zone until the test ends. Records must be
+// made after it is pinned, because model.Make converts them to local time.
+func pinLocal(t *testing.T) {
+	t.Helper()
+	pinZone(t, testZone)
+}
+
+// pinZone makes loc the local zone until the test ends.
+func pinZone(t *testing.T, loc *time.Location) {
+	t.Helper()
+	if time.Local == loc {
+		return
+	}
+	prev := time.Local
+	time.Local = loc
+	t.Cleanup(func() { time.Local = prev })
+}
+
+// sample is four days of usage by three agents, ending on the day of now, so
+// that the fixture moves with whatever clock a test pins.
+func sample(now time.Time) []model.Usage {
 	var out []model.Usage
-	base := time.Date(2026, 8, 25, 10, 0, 0, 0, time.Local)
+	base := aggregate.Day(now).Add(10 * time.Hour)
 	for i, a := range []string{"claude", "codex", "grok"} {
 		for d := 0; d < 4; d++ {
 			u, ok := model.Make(model.MakeOpts{
@@ -36,11 +67,14 @@ func sample() []model.Usage {
 	return out
 }
 
-func newTestModel(w, h int) Model {
-	m := New(Options{Period: aggregate.PeriodDay, Agents: model.Agents, Version: "test"})
+// newTestModel is a loaded model on the fixed clock and zone, sized w x h.
+func newTestModel(t *testing.T, w, h int) Model {
+	t.Helper()
+	pinLocal(t)
+	m := New(Options{Period: aggregate.PeriodDay, Agents: model.Agents, Version: "test", Now: testClock})
 	m.width, m.height = w, h
 	m.loading = false
-	m.records = sample()
+	m.records = sample(testNow)
 	m.recompute()
 	return m
 }
@@ -50,7 +84,7 @@ func newTestModel(w, h int) Model {
 func TestViewFitsTerminalAtAnyWidth(t *testing.T) {
 	for _, w := range []int{40, 52, 60, 72, 80, 96, 120, 200} {
 		for _, h := range []int{12, 18, 24, 40} {
-			m := newTestModel(w, h)
+			m := newTestModel(t, w, h)
 			for _, view := range []aggregate.View{aggregate.ViewTime, aggregate.ViewProject, aggregate.ViewModel, aggregate.ViewHeat} {
 				m.view = view
 				m.recompute()
@@ -69,27 +103,108 @@ func TestViewFitsTerminalAtAnyWidth(t *testing.T) {
 	}
 }
 
+// Below the smallest size the layout is drawn for, the screen says what it
+// needs, at the terminal's real size. It used to draw an 80x24 frame there,
+// which the terminal cut down to its left columns and bottom rows, so the
+// totals and the title were the first things lost.
+func TestTinyTerminalSaysWhatItNeeds(t *testing.T) {
+	withFancy(t, true)
+	for _, size := range [][2]int{{1, 1}, {10, 3}, {20, 30}, {29, 40}, {29, 10}, {30, 9}, {80, 9}, {80, 5}, {200, 1}} {
+		w, h := size[0], size[1]
+		m := newTestModel(t, w, h)
+		body := m.View()
+		lines := strings.Split(body, "\n")
+		if len(lines) != h {
+			t.Errorf("%dx%d: %d lines", w, h, len(lines))
+		}
+		for i, ln := range lines {
+			if got := lipgloss.Width(ln); got > w {
+				t.Errorf("%dx%d: line %d is %d wide: %q", w, h, i, got, stripANSI(ln))
+			}
+			if leak := styleLeak(ln); leak != "" {
+				t.Errorf("%dx%d: line %d: %s", w, h, i, leak)
+			}
+		}
+		if vis := stripANSI(body); w >= 20 && h >= 2 &&
+			(!strings.Contains(vis, "terminal too small") || !strings.Contains(vis, "need 30x10")) {
+			t.Errorf("%dx%d does not say what it needs:\n%s", w, h, vis)
+		}
+	}
+	// At the minimum itself the table is drawn, total and all.
+	m := newTestModel(t, minWidth, minHeight)
+	if vis := stripANSI(m.View()); strings.Contains(vis, "too small") || !strings.Contains(vis, "TOTAL") {
+		t.Errorf("at %dx%d the table should be drawn:\n%s", minWidth, minHeight, vis)
+	}
+}
+
 // Dropping columns must never drop the ones that carry the answer.
 func TestFitColumnsKeepsEssentials(t *testing.T) {
-	m := newTestModel(80, 24)
-	for _, w := range []int{30, 40, 55, 70, 100, 160} {
-		cols := fitColumns(m.columns(), w)
-		if !has(cols, "name") || !has(cols, "total") {
-			t.Fatalf("width %d dropped an essential column: %+v", w, cols)
+	m := newTestModel(t, 80, 24)
+	for _, byModel := range []bool{false, true} {
+		m.byModel = byModel
+		for _, w := range []int{30, 34, 38, 40, 55, 70, 100, 160} {
+			cols := fitColumns(m.columns(), w)
+			if !has(cols, "name") || !has(cols, "total") || has(cols, "model") != byModel {
+				t.Fatalf("by-model %v, width %d dropped an essential column: %+v", byModel, w, cols)
+			}
+			used := 1
+			for _, c := range cols {
+				used += c.width + 1
+			}
+			if used > w && w >= 30 {
+				t.Fatalf("by-model %v, width %d: columns need %d", byModel, w, used)
+			}
 		}
-		used := 1
-		for _, c := range cols {
-			used += c.width + 1
-		}
-		if used > w && w >= 30 {
-			t.Fatalf("width %d: columns need %d", w, used)
+	}
+}
+
+// Split by model, an agent's rows differ only in their model, so the MODEL
+// column has to survive any width the table is drawn at. It used to go with
+// the other medium columns below 82 columns, which at 80, the commonest
+// width, printed the two rows below as identical "claude" lines.
+func TestByModelKeepsTheModelColumn(t *testing.T) {
+	pinLocal(t)
+	var recs []model.Usage
+	for _, mdl := range []string{"claude-opus-4", "claude-haiku-4"} {
+		u, _ := model.Make(model.MakeOpts{Agent: "claude", Time: testNow.Add(-time.Hour), Model: mdl, Input: 100})
+		recs = append(recs, u)
+	}
+	for _, p := range []aggregate.Period{aggregate.PeriodToday, aggregate.PeriodDay} {
+		for w := 30; w <= 200; w++ {
+			m := New(Options{Period: p, Agents: model.Agents, ByModel: true, Now: testClock})
+			m.width, m.height = w, 30
+			m.loading = false
+			m.records = recs
+			m.recompute()
+			m.setAllOpen(true)
+			lines := m.tableView(w, newStyles())
+			if head := stripANSI(lines[0]); !strings.Contains(head, "MODEL") {
+				t.Fatalf("%s at %d columns has no MODEL column: %q", p, w, head)
+			}
+			seen := map[string]bool{}
+			for _, ln := range lines {
+				if got := lipgloss.Width(ln); got > w {
+					t.Fatalf("%s at %d columns: a line is %d wide: %q", p, w, got, stripANSI(ln))
+				}
+				row := strings.TrimSpace(stripANSI(ln))
+				if !strings.Contains(row, "claude") {
+					continue
+				}
+				if seen[row] {
+					t.Fatalf("%s at %d columns: two model rows read the same: %q", p, w, row)
+				}
+				seen[row] = true
+			}
+			if len(seen) != 2 {
+				t.Fatalf("%s at %d columns: %d model rows, want 2", p, w, len(seen))
+			}
 		}
 	}
 }
 
 // A narrow terminal should shed detail columns rather than overflow.
 func TestFitColumnsShedsLowPriorityFirst(t *testing.T) {
-	m := newTestModel(80, 24)
+	m := newTestModel(t, 80, 24)
 	wide := fitColumns(m.columns(), 160)
 	narrow := fitColumns(m.columns(), 44)
 	if len(narrow) >= len(wide) {
@@ -102,7 +217,7 @@ func TestFitColumnsShedsLowPriorityFirst(t *testing.T) {
 
 func TestHelpAndDetailFitTerminal(t *testing.T) {
 	for _, w := range []int{40, 80, 120} {
-		m := newTestModel(w, 30)
+		m := newTestModel(t, w, 30)
 		_ = w
 		m.help = true
 		for i, ln := range strings.Split(m.View(), "\n") {
@@ -126,7 +241,7 @@ func TestHelpAndDetailFitTerminal(t *testing.T) {
 
 // The cursor must stay on a real row no matter how the view changes under it.
 func TestClampKeepsCursorInRange(t *testing.T) {
-	m := newTestModel(100, 24)
+	m := newTestModel(t, 100, 24)
 	m.setAllOpen(true)
 	m.cursor = len(m.flat) - 1
 	m.clamp()
@@ -149,7 +264,7 @@ func TestClampKeepsCursorInRange(t *testing.T) {
 
 // The table total must equal the sum of its top-level rows, expanded or not.
 func TestTotalRowMatchesRowsWhenExpanded(t *testing.T) {
-	m := newTestModel(120, 30)
+	m := newTestModel(t, 120, 30)
 	collapsed := aggregate.Sum(m.rows).Total()
 	m.setAllOpen(true)
 	if got := aggregate.Sum(m.rows).Total(); got != collapsed {
@@ -169,7 +284,7 @@ func TestTotalRowMatchesRowsWhenExpanded(t *testing.T) {
 func TestHelpBoxNeverClipped(t *testing.T) {
 	for _, h := range []int{14, 20, 24, 26, 30, 44} {
 		for _, w := range []int{50, 56, 80, 120} {
-			m := newTestModel(w, h)
+			m := newTestModel(t, w, h)
 			m.help = true
 			body := m.View()
 			lines := strings.Split(body, "\n")
@@ -201,7 +316,7 @@ func TestHelpBoxNeverClipped(t *testing.T) {
 func TestFancyOffProducesPlainOutput(t *testing.T) {
 	withFancy(t, false)
 	for _, w := range []int{50, 80, 120} {
-		m := newTestModel(w, 30)
+		m := newTestModel(t, w, 30)
 		for _, view := range []aggregate.View{aggregate.ViewTime, aggregate.ViewProject, aggregate.ViewHeat} {
 			m.view = view
 			m.recompute()
@@ -224,7 +339,7 @@ func TestFancyOffProducesPlainOutput(t *testing.T) {
 // reflow the summary cards, never drop or resize a column.
 func TestMascotDoesNotAffectTable(t *testing.T) {
 	withFancy(t, true)
-	m := newTestModel(120, 30)
+	m := newTestModel(t, 120, 30)
 	withCat := m.tableView(120, newStyles())
 	m.cat = false
 	withoutCat := m.tableView(120, newStyles())
@@ -243,17 +358,17 @@ func TestMascotDoesNotAffectTable(t *testing.T) {
 func TestMascotYieldsOnNarrowTerminals(t *testing.T) {
 	withFancy(t, true)
 	for _, w := range []int{40, 60, 80} {
-		m := newTestModel(w, 30)
+		m := newTestModel(t, w, 30)
 		if m.showCat() {
 			t.Fatalf("mascot claimed columns at width %d", w)
 		}
 	}
-	m := newTestModel(100, 30)
+	m := newTestModel(t, 100, 30)
 	if !m.showCat() {
 		t.Fatal("mascot should appear when there is room")
 	}
 	// It also has to yield when there is no vertical room for the cards.
-	m = newTestModel(100, 18)
+	m = newTestModel(t, 100, 18)
 	if m.showCat() {
 		t.Fatal("mascot appeared without the cards it aligns to")
 	}
@@ -323,7 +438,7 @@ var ansiFilled = regexp.MustCompile(`\x1b\[38;2;(\d+);\d+;\d+m[\x{2588}\x{258f}\
 // only cycled the six spans, so project/model/hours could not be reached with
 // the keys the footer advertised.
 func TestSpanAndViewAxesAreIndependent(t *testing.T) {
-	m := newTestModel(120, 30)
+	m := newTestModel(t, 120, 30)
 
 	// Tab cycles every view and returns to the start, leaving the span alone.
 	startSpan := m.period
@@ -365,7 +480,7 @@ func TestSpanAndViewAxesAreIndependent(t *testing.T) {
 func TestEveryAxisCombinationRenders(t *testing.T) {
 	for _, p := range periods() {
 		for _, v := range views() {
-			m := newTestModel(120, 30)
+			m := newTestModel(t, 120, 30)
 			m.period, m.view = p, v
 			m.recompute()
 			body := m.View()
@@ -385,7 +500,7 @@ func TestEveryAxisCombinationRenders(t *testing.T) {
 // it, which made the lit span tab a lie, and changing the span silently threw
 // you out of the view.
 func TestHeatmapHonoursSpan(t *testing.T) {
-	m := newTestModel(120, 30)
+	m := newTestModel(t, 120, 30)
 	m.view = aggregate.ViewHeat
 
 	m.period = aggregate.PeriodAll
@@ -409,11 +524,12 @@ func TestHeatmapHonoursSpan(t *testing.T) {
 // text, or an installed alias looks half-applied.
 func TestInvokedNameReachesTheUI(t *testing.T) {
 	withFancy(t, true)
+	pinLocal(t)
 	for _, name := range []string{"tcount", "tokenSummary", "tsum"} {
-		m := New(Options{Agents: model.Agents, Name: name, Version: "0.3.0"})
+		m := New(Options{Agents: model.Agents, Name: name, Version: "0.3.0", Now: testClock})
 		m.width, m.height = 110, 30
 		m.loading = false
-		m.records = sample()
+		m.records = sample(testNow)
 		m.recompute()
 
 		if got := stripANSI(m.titleBar(m.width, newStyles())); !strings.Contains(got, name) {
