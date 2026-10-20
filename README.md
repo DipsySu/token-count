@@ -191,3 +191,7 @@ TUI 快捷键：
 make build
 make test
 ```
+
+## 许可
+
+[0BSD](LICENSE)：随便用、改、分发、商用，不需要保留署名。
