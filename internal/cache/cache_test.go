@@ -119,11 +119,12 @@ func TestLoadIgnoresOtherVersions(t *testing.T) {
 }
 
 // The file name carries the version, so binaries of different versions keep
-// separate indexes rather than discarding each other's.
+// separate indexes rather than discarding each other's. v6 changed what a
+// Codex or Claude log's entry holds.
 func TestDefaultPathNamesTheVersion(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_CACHE_HOME", root)
-	if got, want := DefaultPath(), filepath.Join(root, "token-count", "index-v5.gob"); got != want {
+	if got, want := DefaultPath(), filepath.Join(root, "token-count", "index-v6.gob"); got != want {
 		t.Fatalf("DefaultPath() = %s, want %s", got, want)
 	}
 }

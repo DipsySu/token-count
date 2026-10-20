@@ -20,6 +20,15 @@ import (
 // parseClaude reads a Claude Code session log. Claude replays earlier messages
 // into new files when a session is resumed or forked, so every record carries a
 // dedup key built from the upstream message and request ids.
+//
+// A session started from another, such as a background session, begins its
+// log with a copy of the other's conversation. The copied lines keep their ids
+// and times but take the new session's id and working directory; session_id
+// still names the session they were first written in. Such a line's key gets
+// copyMark, so that deduplication keeps the original, which says where the
+// call was made, and falls back on the copy only where the original's log is
+// gone. Lines without session_id, as older versions write them, are taken for
+// originals.
 func parseClaude(path string) ([]model.Usage, error) {
 	var out []model.Usage
 	cwd := ""
@@ -30,7 +39,10 @@ func parseClaude(path string) ([]model.Usage, error) {
 			Timestamp string `json:"timestamp"`
 			Cwd       string `json:"cwd"`
 			RequestID string `json:"requestId"`
-			Message   struct {
+			SessionID string `json:"sessionId"`
+			// Origin is the session the line was first written in.
+			Origin  string `json:"session_id"`
+			Message struct {
 				ID    string `json:"id"`
 				Model string `json:"model"`
 				Usage *struct {
@@ -63,6 +75,10 @@ func parseClaude(path string) ([]model.Usage, error) {
 		if u.OutputTokensDetails != nil {
 			thinking = u.OutputTokensDetails.ThinkingTokens
 		}
+		key := claudeKey(rec.Message.ID, rec.RequestID, path, seq)
+		if rec.Origin != "" && rec.SessionID != "" && rec.Origin != rec.SessionID {
+			key = copyMark + key
+		}
 		if usage, ok := model.Make(model.MakeOpts{
 			Agent:                   "claude",
 			Time:                    ts,
@@ -74,7 +90,7 @@ func parseClaude(path string) ([]model.Usage, error) {
 			Output:                  u.OutputTokens,
 			Reasoning:               thinking,
 			OutputIncludesReasoning: true,
-			Dedup:                   claudeKey(rec.Message.ID, rec.RequestID, path, seq),
+			Dedup:                   key,
 			Source:                  path,
 		}); ok {
 			out = append(out, usage)
@@ -102,14 +118,29 @@ func claudeKey(messageID, requestID, path string, seq int) string {
 	}
 }
 
-// parseCodex reads a Codex rollout log. Every token_count event carries two
-// figures: last_token_usage, what the exchange that just finished cost, and
-// total_token_usage, the running sum for the thread. Codex publishes the event
-// again whenever something else changes -- the rate limits refresh, the context
-// is compacted, a resumed process announces itself -- so one exchange can
-// appear several times, and summing every event overstated a real history by
-// almost 10%. An event whose running total equals the previous one is such a
-// re-publication and is skipped.
+// parseCodex reads a Codex rollout log. Codex reports usage in two ways, and
+// one log can hold both.
+//
+// Codex 0.154 and later write a token_usage_record line for every upstream
+// response as it completes: what that one response cost, with the response's
+// id. Wherever a log has these records they are what is counted, a call each,
+// because they are the precise report. Every call gets one, including those
+// nothing else reports: compacting the context is an upstream request of its
+// own, which token_count only follows with an empty exchange, and a turn cut
+// short can leave its last response with no token_count at all. Each is
+// written once, so there is no re-publication to see through. And the
+// response id is unique across every log, so a fork or a copy of a log that
+// holds the same response deduplicates exactly, by that id rather than by
+// position.
+//
+// Older versions report usage only in token_count events. Every event carries
+// two figures: last_token_usage, what the exchange that just finished cost,
+// and total_token_usage, the running sum for the thread. Codex publishes the
+// event again whenever something else changes -- the rate limits refresh, the
+// context is compacted, a resumed process announces itself -- so one exchange
+// can appear several times, and summing every event overstated a real history
+// by almost 10%. An event whose running total equals the previous one is such
+// a re-publication and is skipped.
 //
 // The running total serves only to recognise those. It does not measure what
 // an exchange cost: a resumed process starts a fresh total, or one that already
@@ -117,6 +148,13 @@ func claudeKey(messageID, requestID, path string, seq int) string {
 // differ by millions of tokens more, or fewer, than the exchange in between.
 // last_token_usage is therefore the cost whenever it is present, and the
 // difference of totals only stands in for an event that lacks it.
+//
+// The versions that write records still publish token_count events, each
+// repeating the usage of the record written just before it, and a newer Codex
+// that resumes an older session appends its records after the old events. So
+// events count up to a log's first record and are ignored from there on: by
+// then the records report every call the events do, and more, and counting
+// both would count each call twice.
 func parseCodex(path string) ([]model.Usage, error) {
 	var out []model.Usage
 	modelName := ""
@@ -124,7 +162,8 @@ func parseCodex(path string) ([]model.Usage, error) {
 	// token_count events carry no response id, so identity is the thread plus
 	// the position of the exchange within it. Both survive a file being copied
 	// elsewhere, which is what deduplication across roots needs. A timestamp
-	// is not enough on its own: consecutive events can share one.
+	// is not enough on its own: consecutive events can share one. A record
+	// that lacks its response id is keyed the same way.
 	//
 	// The thread is the id in the log's first session_meta, which precedes any
 	// usage event; the filename stem stands in if a log lacks it. session_id
@@ -132,25 +171,40 @@ func parseCodex(path string) ([]model.Usage, error) {
 	// subagent's log, which also quotes its parent's session_meta, so keying on
 	// it merged every subagent's exchanges with its parent's.
 	//
-	// Only counted exchanges advance the position. A re-publication is not an
-	// exchange, and what triggers one has nothing to do with the conversation,
-	// so letting it shift the exchanges after it would make their keys depend
-	// on timing rather than on what was said. Either way a key is a function of
-	// the file's contents, which is all that matching a copy needs.
+	// Only calls advance the position: counted exchanges, and records of some
+	// usage. A re-publication is not an exchange, and what triggers one has
+	// nothing to do with the conversation, so letting it shift the exchanges
+	// after it would make their keys depend on timing rather than on what was
+	// said. Either way a key is a function of the file's contents, which is all
+	// that matching a copy needs.
 	thread := ""
 	seq := 0
+	// position takes the next position and returns the key it makes.
+	position := func() string {
+		seq++
+		id := thread
+		if id == "" {
+			id = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+		}
+		return seqKey("codex", id, seq)
+	}
 	// prev is the running total of the latest usable event that reported one.
 	var prev *codexTokens
+	// recorded is set at the log's first token_usage_record, from where on
+	// token_count events are not counted.
+	recorded := false
 	err := forEachJSONL(path, func(line []byte) {
 		var rec struct {
 			Timestamp string `json:"timestamp"`
 			Type      string `json:"type"`
 			Payload   struct {
-				Type           string `json:"type"`
-				ID             string `json:"id"`
-				Model          string `json:"model"`
-				Cwd            string `json:"cwd"`
-				SessionID      string `json:"session_id"`
+				Type           string       `json:"type"`
+				ID             string       `json:"id"`
+				Model          string       `json:"model"`
+				Cwd            string       `json:"cwd"`
+				SessionID      string       `json:"session_id"`
+				ResponseID     string       `json:"response_id"`
+				Usage          *codexTokens `json:"usage"`
 				ThreadSettings *struct {
 					Model string `json:"model"`
 				} `json:"thread_settings"`
@@ -186,7 +240,29 @@ func parseCodex(path string) ([]model.Usage, error) {
 				modelName = rec.Payload.ThreadSettings.Model
 			}
 			return
-		case rec.Type != "event_msg" || rec.Payload.Type != "token_count":
+		case rec.Type == "token_usage_record":
+			// Whatever this one holds, the log records its responses from
+			// here on, and every token_count event after it repeats one.
+			recorded = true
+			// A record that cannot be placed in time is dropped, as an
+			// untimed event is, and one of no usage is no call.
+			ts, ok := model.ParseTime(rec.Timestamp)
+			if !ok || rec.Payload.Usage == nil {
+				return
+			}
+			usage, ok := codexCall(path, ts, modelName, *rec.Payload.Usage)
+			if !ok {
+				return
+			}
+			// Every call takes a position, which keys it only if it lacks
+			// a response id.
+			usage.Dedup = position()
+			if rec.Payload.ResponseID != "" {
+				usage.Dedup = "codex|resp|" + rec.Payload.ResponseID
+			}
+			out = append(out, usage)
+			return
+		case recorded || rec.Type != "event_msg" || rec.Payload.Type != "token_count":
 			return
 		}
 		info := rec.Payload.Info
@@ -208,33 +284,36 @@ func parseCodex(path string) ([]model.Usage, error) {
 		if !counted {
 			return
 		}
-		seq++
-		id := thread
-		if id == "" {
-			id = strings.TrimSuffix(filepath.Base(path), ".jsonl")
-		}
-		if usage, ok := model.Make(model.MakeOpts{
-			Agent:                   "codex",
-			Time:                    ts,
-			Model:                   modelName,
-			Input:                   use.InputTokens,
-			CacheRead:               use.CachedInputTokens,
-			CacheWrite:              use.CacheWriteInputTokens,
-			Output:                  use.OutputTokens,
-			Reasoning:               use.ReasoningOutputTokens,
-			InputIncludesCache:      true,
-			OutputIncludesReasoning: true,
-			Dedup:                   seqKey("codex", id, seq),
-			Source:                  path,
-		}); ok {
+		key := position()
+		if usage, ok := codexCall(path, ts, modelName, use); ok {
+			usage.Dedup = key
 			out = append(out, usage)
 		}
 	})
 	return backfillProject(out, cwd), err
 }
 
-// codexTokens is one usage block of a token_count event. Input includes the
-// cached part and output includes reasoning, as Codex reports them.
+// codexCall makes the record of one call from its Codex usage block, or
+// reports false for a block of no usage at all.
+func codexCall(path string, ts time.Time, modelName string, use codexTokens) (model.Usage, bool) {
+	return model.Make(model.MakeOpts{
+		Agent:                   "codex",
+		Time:                    ts,
+		Model:                   modelName,
+		Input:                   use.InputTokens,
+		CacheRead:               use.CachedInputTokens,
+		CacheWrite:              use.CacheWriteInputTokens,
+		Output:                  use.OutputTokens,
+		Reasoning:               use.ReasoningOutputTokens,
+		InputIncludesCache:      true,
+		OutputIncludesReasoning: true,
+		Source:                  path,
+	})
+}
+
+// codexTokens is one usage block, of a token_usage_record or a token_count
+// event. Input includes the cached part and output includes reasoning, as
+// Codex reports them.
 type codexTokens struct {
 	InputTokens           int64 `json:"input_tokens"`
 	CachedInputTokens     int64 `json:"cached_input_tokens"`

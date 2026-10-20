@@ -1,11 +1,13 @@
 package source
 
 import (
+	"cmp"
 	"errors"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -39,7 +41,7 @@ type Issue struct {
 }
 
 // Collect parses every session file for the requested agents and returns the
-// deduplicated records.
+// deduplicated records, in time order.
 func Collect(agents []string, c *cache.Cache, progress ProgressFunc) []model.Usage {
 	recs, _ := CollectStats(agents, c, progress)
 	return recs
@@ -94,8 +96,8 @@ func sortIssues(issues []Issue) {
 	})
 }
 
-// dedup collapses records that describe the same upstream response, keeping
-// the largest.
+// dedup collapses records that describe the same upstream response into one,
+// and returns the survivors in time order.
 //
 // Two different things produce repeats, and they need the same treatment.
 // Claude Code replays earlier messages into a new log every time a session is
@@ -104,38 +106,104 @@ func sortIssues(issues []Issue) {
 // and the final one carries the real figure. Keeping whichever record was seen
 // first therefore threw away most of the output tokens -- 26% of them across a
 // real history -- even though the totals looked nearly right, because output is
-// small next to cached input.
+// small next to cached input. The largest snapshot is the complete one, so the
+// largest record survives.
 //
-// The largest snapshot is the complete one. Selecting by size rather than by
-// position also makes the result independent of the order files happen to be
-// scanned in, which matters because collection runs in parallel.
+// Records of one response often tie on size, though, and then differ in what
+// says where the response is counted. Claude Code writes a snapshot for every
+// block of a response, each at its own time, so ties within a log differ in
+// time; and a copy in another session's log takes that session's working
+// directory, so ties across logs differ in project and file. Collection runs
+// in parallel, so taking whichever copy came first made those depend on the
+// run: one project's call count moved by one between runs over the same logs.
+// The survivor is therefore chosen by content alone, in this order:
 //
-// Records without a key are kept as-is: their format offers nothing to match on.
+//   - the largest record, which is the complete snapshot;
+//   - the original rather than a copy that a log holds of a call made in
+//     another session (see copyMark), since the original says where the
+//     call was made;
+//   - the record logged first, which is when the response was first seen;
+//   - and, for a choice that never depends on the order the records came
+//     in, the first in a fixed order of every other field (compareRecords).
+//
+// The survivors are returned in time order, for the same reason: buckets that
+// tie on size and label are listed in the order their first record arrived.
+//
+// Records without a key are kept as-is: their format offers nothing to match
+// on.
 func dedup(recs []model.Usage, stats *Stats) []model.Usage {
-	at := make(map[string]int, len(recs))
-	out := recs[:0:0]
+	type kept struct {
+		at     int // where the survivor is in out
+		copied bool
+	}
+	best := make(map[string]kept, len(recs))
+	out := make([]model.Usage, 0, len(recs))
 	for _, r := range recs {
-		if r.Dedup == "" {
+		key, copied := strings.CutPrefix(r.Dedup, copyMark)
+		r.Dedup = key
+		if key == "" {
 			out = append(out, r)
 			continue
 		}
-		i, seen := at[r.Dedup]
+		k, seen := best[key]
 		if !seen {
-			at[r.Dedup] = len(out)
+			best[key] = kept{len(out), copied}
 			out = append(out, r)
 			continue
 		}
 		superseded := r
-		if r.Total() > out[i].Total() {
-			superseded = out[i]
-			out[i] = r
+		if survives(r, copied, out[k.at], k.copied) {
+			superseded = out[k.at]
+			out[k.at] = r
+			best[key] = kept{k.at, copied}
 		}
 		if stats != nil {
 			stats.Dropped++
 			stats.DroppedTokens += superseded.Total()
 		}
 	}
+	slices.SortFunc(out, compareRecords)
 	return out
+}
+
+// copyMark heads the key of a record that a log holds as a copy of a call
+// made in another session. Claude Code copies a session's conversation into
+// the log of a session it starts from it, rewriting each line's session and
+// working directory, so a copy matches the original's key but not where the
+// call was made. dedup matches a copy with its original by the rest of the
+// key, prefers the original, and returns every survivor under the plain key:
+// the mark never leaves this package, other than in the cache.
+const copyMark = "copy|"
+
+// survives reports whether a, a copy if aCopy, wins over b, a copy if bCopy,
+// as the one record kept of a response both describe.
+func survives(a model.Usage, aCopy bool, b model.Usage, bCopy bool) bool {
+	if a.Total() != b.Total() {
+		return a.Total() > b.Total()
+	}
+	if aCopy != bCopy {
+		return bCopy
+	}
+	return compareRecords(a, b) < 0
+}
+
+// compareRecords orders records by time, and records of the same time by
+// every other field, so that only identical records compare equal.
+func compareRecords(a, b model.Usage) int {
+	return cmp.Or(
+		a.Time.Compare(b.Time),
+		strings.Compare(a.Agent, b.Agent),
+		strings.Compare(a.Dedup, b.Dedup),
+		strings.Compare(a.Source, b.Source),
+		strings.Compare(a.Project, b.Project),
+		strings.Compare(a.Model, b.Model),
+		cmp.Compare(a.Calls, b.Calls),
+		cmp.Compare(a.Input, b.Input),
+		cmp.Compare(a.CacheRead, b.CacheRead),
+		cmp.Compare(a.CacheWrite, b.CacheWrite),
+		cmp.Compare(a.Output, b.Output),
+		cmp.Compare(a.Reasoning, b.Reasoning),
+	)
 }
 
 func collectAgent(agent string, c *cache.Cache) ([]model.Usage, []Issue) {

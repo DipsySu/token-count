@@ -11,10 +11,13 @@ import (
 	"token-count/internal/model"
 )
 
-// Bumped whenever the shape or meaning of a cached record changes; v5 stopped
-// counting the token_count events Codex publishes again unchanged, and keys
-// Codex records by thread, so Codex entries cached earlier are wrong.
-const version = 5
+// Bumped whenever the shape or meaning of a cached record changes. v5 stopped
+// counting the token_count events Codex publishes again unchanged, and keyed
+// Codex records by thread. v6 counts a Codex log's token_usage_record lines,
+// one per response, keyed by response id and timed by the record, in place of
+// the token_count events that repeat them, and marks the key of a call Claude
+// Code copied into another session's log. Entries cached earlier lack both.
+const version = 6
 
 func init() {
 	gob.Register(time.Time{})

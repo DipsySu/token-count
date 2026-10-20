@@ -1,8 +1,13 @@
 package source
 
 import (
+	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -209,24 +214,198 @@ func outputs(recs []model.Usage) []int64 {
 	return out
 }
 
-// The surviving record keeps its position, so a stable input order gives a
-// stable output order.
-func TestDedupPreservesPosition(t *testing.T) {
+// dedup returns the survivors in time order, then by agent and key, whatever
+// order the records came in. Collection runs in parallel, and the order is
+// visible downstream: buckets that tie on size and label are listed in the
+// order their first record arrived.
+func TestDedupReturnsRecordsInTimeOrder(t *testing.T) {
+	at := func(r model.Usage, min int) model.Usage {
+		r.Time = time.Date(2026, 8, 25, 12, min, 0, 0, time.Local)
+		return r
+	}
 	recs := []model.Usage{
-		usageOut("a", 100, 5),
-		usageOut("b", 100, 5),
-		usageOut("a", 100, 900), // supersedes the first record in place
-		usageOut("c", 100, 5),
+		at(usageOut("claude|c", 100, 5), 3),
+		at(usageOut("claude|b", 100, 5), 1),
+		at(usageOut("claude|a", 100, 5), 1),
+		at(usageOut("claude|a", 100, 900), 2), // the complete snapshot, logged later
+		at(usage("codex", "codex|a", 7), 1),
+		at(usage("claude", "", 9), 0),
 	}
 	got := dedup(recs, nil)
-	if len(got) != 3 {
-		t.Fatalf("kept %d, want 3", len(got))
+	var order []string
+	for _, r := range got {
+		order = append(order, r.Time.Format("15:04")+" "+r.Dedup)
 	}
-	if got[0].Dedup != "a" || got[1].Dedup != "b" || got[2].Dedup != "c" {
-		t.Fatalf("order changed: %s %s %s", got[0].Dedup, got[1].Dedup, got[2].Dedup)
+	if want := "12:00  12:01 claude|b 12:01 codex|a 12:02 claude|a 12:03 claude|c"; strings.Join(order, " ") != want {
+		t.Fatalf("order %q, want %q", strings.Join(order, " "), want)
 	}
-	if got[0].Output != 900 {
-		t.Fatalf("position 0 kept output %d, want 900", got[0].Output)
+}
+
+// tied is a Claude record of a fixed size, so that records made from it tie
+// on size and differ only where a test changes them.
+func tied(key string) model.Usage {
+	return model.Usage{
+		Agent:     "claude",
+		Time:      time.Date(2026, 8, 25, 12, 0, 0, 0, time.Local),
+		Model:     "claude-fable-5",
+		Project:   "/home/u/proj",
+		Input:     10,
+		CacheRead: 90,
+		Output:    5,
+		Calls:     1,
+		Dedup:     key,
+		Source:    "/home/u/.claude/projects/-home-u-proj/s-1.jsonl",
+	}
+}
+
+// with returns r changed by f.
+func with(r model.Usage, f func(*model.Usage)) model.Usage {
+	f(&r)
+	return r
+}
+
+// Copies of one response that tie on size can differ in everything else, and
+// the one that survives decides where the response is counted: its project,
+// model and day. So the choice must follow from the copies alone, whatever
+// order they arrive in. A copy that Claude Code made in another session's log
+// loses to the original, which says where the call was made; otherwise the
+// copy logged first wins, and after that the first in a fixed order of the
+// remaining fields.
+func TestDedupBreaksTiesByContent(t *testing.T) {
+	const key = "claude|msg_1|req_A"
+	base := tied(key)
+	cases := []struct {
+		name       string
+		want, lose model.Usage
+	}{
+		{"time", base, with(base, func(r *model.Usage) { r.Time = r.Time.Add(5 * time.Second) })},
+		{"source", base, with(base, func(r *model.Usage) { r.Source = strings.Replace(r.Source, "s-1", "s-2", 1) })},
+		{"project", base, with(base, func(r *model.Usage) { r.Project += "/sub" })},
+		{"model", base, with(base, func(r *model.Usage) { r.Model = "claude-opus-5-5" })},
+		{"calls", base, with(base, func(r *model.Usage) { r.Calls = 2 })},
+		{"split", base, with(base, func(r *model.Usage) { r.Input, r.CacheRead = 20, 80 })},
+		// The copy is earlier and comes first in every other field, and
+		// still loses.
+		{"copy", with(base, func(r *model.Usage) {
+			r.Time = r.Time.Add(time.Second)
+			r.Source = strings.Replace(r.Source, "s-1", "s-2", 1)
+			r.Project += "/sub"
+		}), with(base, func(r *model.Usage) { r.Dedup = copyMark + key })},
+	}
+	for _, c := range cases {
+		want := c.want
+		want.Dedup = key // survivors carry the plain key
+		for _, recs := range [][]model.Usage{{c.want, c.lose}, {c.lose, c.want}} {
+			var stats Stats
+			got := dedup(recs, &stats)
+			if len(got) != 1 || !reflect.DeepEqual(got[0], want) {
+				t.Errorf("%s: kept %+v\nwant %+v", c.name, got, want)
+			}
+			if stats.Dropped != 1 || stats.DroppedTokens != c.lose.Total() {
+				t.Errorf("%s: stats %+v", c.name, stats)
+			}
+		}
+	}
+}
+
+// Shuffling the records changes nothing in what dedup returns: the same
+// survivors, identical in every field, in the same order, and the same count
+// of what was dropped.
+func TestDedupIgnoresInputOrder(t *testing.T) {
+	var pool []model.Usage
+	for i := range 20 {
+		r := tied(fmt.Sprintf("claude|msg_%d|req_%d", i, i))
+		r.Time = r.Time.Add(time.Duration(i%7) * time.Minute) // some share a time
+		pool = append(pool, r,
+			with(r, func(r *model.Usage) { r.Time = r.Time.Add(3 * time.Second) }),
+			with(r, func(r *model.Usage) { r.Source = strings.Replace(r.Source, "s-1", "s-2", 1) }),
+			with(r, func(r *model.Usage) { r.Project += "/sub" }),
+			with(r, func(r *model.Usage) { r.Model = "claude-opus-5-5" }),
+			with(r, func(r *model.Usage) { r.Input, r.CacheRead = 20, 80 }),
+			with(r, func(r *model.Usage) {
+				r.Dedup = copyMark + r.Dedup
+				r.Project = "/home/u/other"
+			}),
+			with(r, func(r *model.Usage) { r.Output = 1 }), // a partial snapshot
+		)
+	}
+	// Records without a key are all kept, identical or not.
+	for i := range 3 {
+		r := tied("")
+		r.Time = r.Time.Add(time.Duration(i) * time.Minute)
+		pool = append(pool, r, r, with(r, func(r *model.Usage) { r.Project += "/sub" }))
+	}
+	rng := rand.New(rand.NewPCG(1, 2))
+	var (
+		want      []model.Usage
+		wantStats Stats
+	)
+	for i := range 200 {
+		recs := slices.Clone(pool)
+		rng.Shuffle(len(recs), func(i, j int) { recs[i], recs[j] = recs[j], recs[i] })
+		var stats Stats
+		got := dedup(recs, &stats)
+		if i == 0 {
+			want, wantStats = got, stats
+			if len(got) != 20+9 {
+				t.Fatalf("kept %d records, want %d", len(got), 20+9)
+			}
+			continue
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Fatalf("shuffle %d: output differs from the first", i)
+		}
+		if stats.Dropped != wantStats.Dropped || stats.DroppedTokens != wantStats.DroppedTokens {
+			t.Fatalf("shuffle %d: stats %+v, first %+v", i, stats, wantStats)
+		}
+	}
+}
+
+// claudeLine renders an assistant line of Claude Code's log for the response
+// msg_1/req_A, written by session in cwd. origin is what the line says in
+// session_id, the session it was first written in, and is left out if empty,
+// as older versions do.
+func claudeLine(session, origin, cwd string) string {
+	sid := ""
+	if origin != "" {
+		sid = fmt.Sprintf(`,"session_id":%q`, origin)
+	}
+	return fmt.Sprintf(`{"type":"assistant","timestamp":"2026-08-25T03:00:00.000Z","cwd":%q,"sessionId":%q%s,"requestId":"req_A","message":{"id":"msg_1","model":"claude-fable-5","usage":{"input_tokens":2,"cache_read_input_tokens":100,"cache_creation_input_tokens":10,"output_tokens":20}}}`,
+		cwd, session, sid)
+}
+
+// Claude Code copies a session's conversation into the log of a session it
+// starts from it, such as a background session. A copied line keeps the ids
+// and the time, but takes the new session's id and working directory, and
+// keeps the original session's id in session_id. The original says where the
+// call was made, so it survives, in whichever order the logs are read; a copy
+// whose original is gone still counts.
+func TestDedupKeepsTheOriginalOfACopiedClaudeCall(t *testing.T) {
+	dir := t.TempDir()
+	// The copy comes first by file and by project, so only knowing it for a
+	// copy can make the original survive.
+	orig := writeLines(t, filepath.Join(dir, "sess-z.jsonl"), claudeLine("sess-z", "sess-z", "/home/u/proj/sub"))
+	copied := writeLines(t, filepath.Join(dir, "sess-a.jsonl"), claudeLine("sess-a", "sess-z", "/home/u/proj"))
+	a, b := parseFile(t, parseClaude, orig), parseFile(t, parseClaude, copied)
+	const key = "claude|msg_1|req_A"
+	for _, recs := range [][]model.Usage{append(slices.Clone(a), b...), append(slices.Clone(b), a...)} {
+		kept := dedup(recs, nil)
+		if len(kept) != 1 || kept[0].Project != "/home/u/proj/sub" || kept[0].Source != orig || kept[0].Dedup != key {
+			t.Fatalf("kept %+v, want the original in %s", kept, orig)
+		}
+	}
+	if kept := dedup(b, nil); len(kept) != 1 || kept[0].Project != "/home/u/proj" || kept[0].Dedup != key {
+		t.Fatalf("a copy on its own: kept %+v", kept)
+	}
+	// A line that names no origin, as older versions write them, counts as
+	// an original, and ties with another as originals do: here the first
+	// by file wins.
+	older := writeLines(t, filepath.Join(dir, "sess-c.jsonl"), claudeLine("sess-c", "", "/home/u/proj"))
+	c := parseFile(t, parseClaude, older)
+	for _, recs := range [][]model.Usage{append(slices.Clone(a), c...), append(slices.Clone(c), a...)} {
+		if kept := dedup(recs, nil); len(kept) != 1 || kept[0].Source != older {
+			t.Fatalf("kept %+v, want the record from %s", kept, older)
+		}
 	}
 }
 
@@ -243,6 +422,7 @@ func TestEveryParserEmitsDedupKeys(t *testing.T) {
 		{"claude-dupes", parseClaude, "claude_dupes.jsonl"},
 		{"codex", parseCodex, "codex.jsonl"},
 		{"codex-republished", parseCodex, "codex_republished.jsonl"},
+		{"codex-records", parseCodex, "codex_records.jsonl"},
 		{"grok", parseGrok, "grok_updates.jsonl"},
 	}
 	for _, c := range cases {
@@ -282,6 +462,7 @@ func TestKeysAreStableAcrossRoots(t *testing.T) {
 	}{
 		{"codex", parseCodex, "codex.jsonl", "sessions/2026/08/25"},
 		{"codex-republished", parseCodex, "codex_republished.jsonl", "sessions/2026/08/25"},
+		{"codex-records", parseCodex, "codex_records.jsonl", "sessions/2026/09/20"},
 		{"claude", parseClaude, "claude.jsonl", "projects/-home-u-proj"},
 		{"claude-dupes", parseClaude, "claude_dupes.jsonl", "projects/-home-u-proj"},
 	}
