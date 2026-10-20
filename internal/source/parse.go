@@ -479,6 +479,8 @@ func parseGemini(path string) ([]model.Usage, error) {
 				CachedContentTokenCount int64 `json:"cached_content_token_count"`
 				Thoughts                int64 `json:"thoughts"`
 				ThoughtsTokenCount      int64 `json:"thoughts_token_count"`
+				Tool                    int64 `json:"tool"`
+				ToolUsePromptTokenCount int64 `json:"tool_use_prompt_token_count"`
 			} `json:"tokens"`
 		} `json:"messages"`
 	}
@@ -509,12 +511,18 @@ func parseGemini(path string) ([]model.Usage, error) {
 		if thoughts == 0 {
 			thoughts = msg.Tokens.ThoughtsTokenCount
 		}
+		// tokens.tool is toolUsePromptTokenCount: uncached prompt-side input
+		// billed on top of tokens.input, never part of cached.
+		tool := msg.Tokens.Tool
+		if tool == 0 {
+			tool = msg.Tokens.ToolUsePromptTokenCount
+		}
 		if usage, ok := model.Make(model.MakeOpts{
 			Agent:                   "gemini",
 			Time:                    ts,
 			Model:                   msg.Model,
 			Project:                 rec.Cwd,
-			Input:                   msg.Tokens.Input,
+			Input:                   msg.Tokens.Input + tool,
 			CacheRead:               cached,
 			Output:                  msg.Tokens.Output,
 			Reasoning:               thoughts,
