@@ -15,6 +15,7 @@ AGENTS = ["claude", "codex", "grok", "gemini"]
 # tcount snapshot.all field -> ccusage totals field
 FIELDS = [("input", "inputTokens"), ("cache_read", "cacheReadTokens"),
           ("cache_write", "cacheCreationTokens"), ("output", "outputTokens"),
+          ("reasoning", ("reasoningOutputTokens", "reasoningTokens")),
           ("total", "totalTokens")]
 
 # Documented differences in how the two tools *report* the same usage. Each
@@ -61,7 +62,13 @@ def main():
     for agent in a.agents.split(","):
         t, c = tcount(agent, env, repo), ccusage(agent, env)
         for tf, cf in FIELDS:
-            tv, cv = t.get(tf, 0), int(c.get(cf, 0) or 0)
+            names = cf if isinstance(cf, tuple) else (cf,)
+            hit = next((n for n in names if n in c), None)
+            if hit is None and isinstance(cf, tuple):
+                # ccusage does not report reasoning for this agent's totals
+                print(f"{agent:7} {tf:12} {t.get(tf, 0):>14,} {'-':>14} {'':>12}  n/a (ccusage omits)")
+                continue
+            tv, cv = t.get(tf, 0), int(c.get(hit, 0) or 0) if hit else 0
             status = "ok"
             if tv != cv:
                 known = KNOWN.get((agent, tf))
