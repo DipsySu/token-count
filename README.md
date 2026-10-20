@@ -17,6 +17,11 @@ agent 会把同一次调用写好几遍，tcount 全局去重，每次上游调�
 - **Codex** 的 `token_count` 事件会在限流刷新、上下文压缩、进程恢复时原样再发一遍，累计值没变的那条跳过，每次交换的花费取 `last_token_usage`。新版 Codex 的日志带 `token_usage_record` 行：每行就是一次上游调用，按 `response_id` 去重；同一文件里第一条 record 之后的 `token_count` 不再计入，只有它之前的部分（老版本写的）按事件算。子 agent 的线程单独计入；拷到别处的日志（换机器、多个目录）只算一次。
 - **Grok** 的 `turn_completed` 按会话 + 轮次（+ 模型）去重，**Gemini** 按会话文件和消息序号，**OpenCode** 按消息 id。
 
+已知取舍（与 ccusage 一致）：
+
+- Codex 的交换按「时间戳 + 模型 + 各项 token」去重，所以两个真不同的会话若在同一毫秒、同一模型、各项 token 完全相同，会被合并成一条。测试 `TestCodexIdenticalExchangesInDifferentSessionsMerge` 钉住了这一行为。
+- Codex 子 agent 的日志开头会重放父会话历史。tcount 把开头相邻间隔不超过 1 秒的那一串 `token_count` 当作重放丢掉；如果子 agent 自己的前两次调用真在 1 秒内，会被少算。目前只用夹具验证过，等有真实子 agent 日志再复核。
+
 `--json` 输出里的 `deduped` 说明丢掉了多少，统计的是整次加载，不限于当前窗口。
 
 ## 安装
