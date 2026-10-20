@@ -55,43 +55,46 @@ func (m Model) helpOrBody(w, h int, st Styles) string {
 	return strings.Join(m.compose(w, h, st), "\n")
 }
 
-// compose lays the screen out top to bottom. Every section returns a fixed
-// number of lines so the total always matches the terminal height.
+// compose lays the screen out top to bottom, drawing what layout decided
+// fits, so the frame is always exactly the terminal's height.
 func (m Model) compose(w, h int, st Styles) []string {
-	var out []string
-	out = append(out, m.titleBar(w, st))
-	out = append(out, m.tabBar(w, st))
-
-	if m.showCards() {
-		out = append(out, "")
-		out = append(out, m.cards(w, st)...)
+	l := m.layout()
+	out := make([]string, 0, h)
+	out = append(out, m.titleBar(w, st), m.tabBar(w, st), m.scopeLine(w, st))
+	if l.cards {
+		out = append(out, m.caption(w, st))
+		out = append(out, m.cards(w, st, l.cat)...)
 	}
-	out = append(out, "")
-
-	if n := m.notice(); n != "" {
-		out = append(out, st.Notice.Render(truncate(" "+n, w)))
+	if l.spacer {
+		out = append(out, "")
+	}
+	if l.notice != "" {
+		style := st.Notice
+		if l.warn {
+			style = st.Warn
+		}
+		out = append(out, style.Render(truncate(" "+l.notice, w)))
 	}
 
 	switch {
 	case m.loading:
-		out = append(out, m.loadingBody(w, h-len(out)-1, st)...)
+		out = append(out, m.loadingBody(w, l.body, st)...)
 	case m.err != nil:
 		out = append(out, st.Err.Render(truncate("  "+m.err.Error(), w)))
 	case m.view == aggregate.ViewHeat:
-		out = append(out, m.heatView(w, st)...)
+		out = append(out, heatFit(m.heatView(w, st), l.body)...)
 	default:
 		out = append(out, m.tableView(w, st)...)
 	}
 
-	if m.detail && !m.loading {
+	if l.detail {
 		out = append(out, m.detailView(w, st)...)
 	}
 
 	for len(out) < h-1 {
 		out = append(out, "")
 	}
-	out = append(out[:h-1], m.footer(w, st))
-	return out
+	return append(out[:h-1], m.footer(w, st))
 }
 
 func (m Model) titleBar(w int, st Styles) string {
@@ -117,29 +120,83 @@ func (m Model) titleBar(w int, st Styles) string {
 // tabBar draws the two independent axes: which span of time is shown, and how
 // it is grouped. They are separate groups because they combine freely -- a
 // project ranking for last week is a valid state -- so exactly one tab in each
-// group is always lit, and each group has its own key.
+// group is always lit, and each group has its own key. The filters live on
+// the scope line below; the mascot's mood sits on the right when it fits.
+//
+// A strip that does not fit is not cut, which would leave half a label:
+// it gives up the padding of its unlit tabs first, and then shows only the
+// lit tab of each group, with the key that moves it.
 func (m Model) tabBar(w int, st Styles) string {
+	chip := ""
+	if m.layout().cat {
+		// The mascot's expression is graded, not decorative; naming the grade
+		// keeps it readable instead of a private joke.
+		chip = gradientByValue(catMoodChip(m.mood, m.snapshot["today"].Totals.Total()), 0.35, rampCat()) + " "
+	}
+	strips := []string{m.tabStrip(st, false), m.tabStrip(st, true), m.litTabs(st, true), m.litTabs(st, false)}
+	for _, s := range strips {
+		if ansi.StringWidth(s) <= w {
+			return joinLR(s, chip, w)
+		}
+	}
+	return truncate(strips[len(strips)-1], w)
+}
+
+// tabStrip is every tab of both groups. A compact strip drops the padding of
+// the unlit tabs and narrows the divider; one space keeps two unlit tabs
+// apart, while the lit tab's own padding sets it off from its neighbours.
+func (m Model) tabStrip(st Styles, compact bool) string {
+	type tab struct {
+		label string
+		lit   bool
+		rule  bool // the divider between the groups
+	}
+	var tabs []tab
+	for _, p := range periods() {
+		tabs = append(tabs, tab{label: string(p), lit: p == m.period})
+	}
+	tabs = append(tabs, tab{rule: true})
+	for _, v := range views() {
+		tabs = append(tabs, tab{label: viewLabel(v), lit: v == m.view})
+	}
+
 	var b strings.Builder
 	b.WriteByte(' ')
-	for _, p := range periods() {
-		if p == m.period {
-			b.WriteString(st.TabOn.Render(string(p)))
-		} else {
-			b.WriteString(st.Tab.Render(string(p)))
+	unlit := st.Tab
+	if compact {
+		unlit = st.Tab.Padding(0)
+	}
+	for i, t := range tabs {
+		if compact && i > 0 && !t.lit && !tabs[i-1].lit {
+			b.WriteByte(' ')
+		}
+		switch {
+		case t.rule && compact:
+			b.WriteString(st.Faint.Render("│"))
+		case t.rule:
+			// A wide, dim divider: the two groups must not read as one
+			// strip that a single pair of arrow keys could walk end to end.
+			b.WriteString(st.Faint.Render("   │  "))
+		case t.lit:
+			b.WriteString(st.TabOn.Render(t.label))
+		default:
+			b.WriteString(unlit.Render(t.label))
 		}
 	}
-	// A wide, dim divider: the two groups must not read as one strip that a
-	// single pair of arrow keys could walk end to end.
-	b.WriteString(st.Faint.Render("   \u2502  "))
-	for _, v := range views() {
-		label := viewLabel(v)
-		if m.view == v {
-			b.WriteString(st.TabOn.Render(label))
-		} else {
-			b.WriteString(st.Tab.Render(label))
+	return b.String()
+}
+
+// litTabs is the lit tab of each group alone, with the keys that move it
+// when there is room for them.
+func (m Model) litTabs(st Styles, keys bool) string {
+	lit := func(label, key string) string {
+		s := st.Faint.Render("‹") + st.TabOn.Render(label) + st.Faint.Render("›")
+		if keys {
+			s += " " + st.Key.Render(key)
 		}
+		return s
 	}
-	return joinLR(b.String(), m.statusChips(st), w)
+	return " " + lit(string(m.period), "←→") + "   " + lit(viewLabel(m.view), "tab")
 }
 
 func viewLabel(v aggregate.View) string {
@@ -155,40 +212,10 @@ func viewLabel(v aggregate.View) string {
 	}
 }
 
-// statusChips shows the filters that are currently narrowing the view, so an
-// unexpected number always has a visible cause.
-func (m Model) statusChips(st Styles) string {
-	var chips []string
-	if m.agent != "" {
-		chips = append(chips, agentStyle(m.agent).Render(m.agent))
-	}
-	if m.byModel {
-		chips = append(chips, st.Muted.Render("by-model"))
-	}
-	if m.sort != sortDefault {
-		chips = append(chips, st.Muted.Render("↓"+m.sort.String()))
-	}
-	if m.seeking {
-		chips = append(chips, st.Key.Render("/"+m.search+"▏"))
-	} else if m.search != "" {
-		chips = append(chips, st.Key.Render("/"+m.search))
-	}
-	if len(chips) == 0 {
-		chips = append(chips, st.Faint.Render("all agents"))
-	}
-	if m.showCat() {
-		// The mascot's expression is graded, not decorative; naming the grade
-		// keeps it readable instead of a private joke.
-		chips = append(chips, gradientByValue(
-			catMoodChip(m.mood(), m.snapshot["today"].Totals.Total()), 0.35, rampCat()))
-	}
-	return strings.Join(chips, st.Faint.Render(" · ")) + " "
-}
-
 // cards renders the four headline figures with a trend line and a comparison
-// against the equivalent previous period. When there is width to spare the
+// against the same elapsed part of the previous period. With cat set the
 // mascot sits to their left, occupying the same four lines.
-func (m Model) cards(w int, st Styles) []string {
+func (m Model) cards(w int, st Styles, cat bool) []string {
 	items := []struct {
 		key, title string
 		period     aggregate.Period
@@ -200,9 +227,9 @@ func (m Model) cards(w int, st Styles) []string {
 	}
 
 	catCols := 0
-	var cat []string
-	if m.showCat() {
-		cat = catStrip(catArt(m.mood()))
+	var art []string
+	if cat {
+		art = catStrip(catArt(m.mood))
 		catCols = catWidth + 1
 	}
 
@@ -212,7 +239,6 @@ func (m Model) cards(w int, st Styles) []string {
 	}
 
 	rows := make([][]string, 4)
-	peak := m.peakDay()
 	for _, it := range items {
 		snap := m.snapshot[it.key]
 		inner := cw - 2
@@ -228,8 +254,8 @@ func (m Model) cards(w int, st Styles) []string {
 			// Hue tracks how the figure compares with the busiest day, so a
 			// heavy period reads warm at a glance.
 			t := 0.0
-			if peak > 0 {
-				t = clamp01(float64(total) / float64(peak) / cardHeat(it.key))
+			if m.peak > 0 {
+				t = clamp01(float64(total) / float64(m.peak) / cardHeat(it.key))
 			}
 			value = gradientBold(model.FmtTokens(total), shiftRamp(rampVolume(), t))
 		}
@@ -266,8 +292,8 @@ func (m Model) cards(w int, st Styles) []string {
 	out := make([]string, 0, 4)
 	for i, r := range rows {
 		line := " "
-		if cat != nil && i < len(cat) {
-			line += cat[i] + " "
+		if art != nil && i < len(art) {
+			line += art[i] + " "
 		}
 		line += strings.Join(r, "")
 		out = append(out, truncate(line, w))
@@ -301,33 +327,12 @@ func shiftRamp(r ramp, t float64) ramp {
 	return ramp{lo, hi}
 }
 
-// mood grades today against the busiest day on record.
-func (m Model) mood() catMood {
-	return moodFor(m.snapshot["today"].Totals.Total(), m.peakDay())
-}
+// showCat reports whether the mascot is drawn in the current frame.
+func (m Model) showCat() bool { return m.layout().cat }
 
-// peakDay is the largest single-day total seen, used as the yardstick for both
-// the mascot's mood and the card hues.
-func (m Model) peakDay() int64 {
-	var peak int64
-	for _, v := range m.snapshot["year"].Trend {
-		if v > peak {
-			peak = v
-		}
-	}
-	for _, v := range m.snapshot["today"].Trend {
-		if v > peak {
-			peak = v
-		}
-	}
-	return peak
-}
-
-// showCat reports whether there is room to spend columns on the mascot.
-func (m Model) showCat() bool {
-	return m.cat && fancyEnabled() && m.width >= 84 && m.showCards()
-}
-
+// prevLabel names what a card's delta compares with. Each is like for like:
+// yesterday up to the same time of day, last week up to the same weekday and
+// time, last month up to the same day and time.
 func prevLabel(key string) string {
 	switch key {
 	case "today":
@@ -350,12 +355,13 @@ func fitSeries(vals []int64, width int) []int64 {
 	return vals[len(vals)-width:]
 }
 
+// loadingBody is the scan screen in h lines.
 func (m Model) loadingBody(w, h int, st Styles) []string {
 	frame := spinner[m.spin%len(spinner)]
 	var out []string
-	if m.cat && fancyEnabled() && w >= 52 {
+	if m.cat && fancyEnabled() && w >= 52 && h >= 4 {
 		// The cat blinks and swishes while the scan runs, so the wait has
-		// something to watch other than a spinner.
+		// something to watch other than a spinner. It is four lines tall.
 		art := catStrip(catBlink(m.spin / 3))
 		notes := []string{
 			st.Dim.Render(frame + " scanning session logs"),
@@ -380,12 +386,14 @@ func (m Model) loadingBody(w, h int, st Styles) []string {
 	for len(out) < h {
 		out = append(out, "")
 	}
-	return out
+	return out[:max(h, 0)]
 }
 
 func (m Model) footer(w int, st Styles) string {
-	if m.seeking {
-		return st.Footer.Render(truncate(" type to filter   enter accept   esc clear", w))
+	if m.input.Focused() {
+		line := st.Footer.Render(" type an agent, model or project") + st.Faint.Render("   ") +
+			st.Key.Render("ctrl+c") + st.Footer.Render(" quit")
+		return joinLR(truncate(line, w), m.footerRight(st), w)
 	}
 	if m.loading {
 		return st.Footer.Render(truncate(" scanning…", w))
@@ -417,11 +425,11 @@ func (m Model) footerRight(st Styles) string {
 		above := m.offset
 		below := n - min(m.offset+vis, n)
 		if above > 0 {
-			b.WriteString(st.Key.Render("\u2191" + model.Comma(int64(above))))
+			b.WriteString(st.Key.Render("↑" + model.Comma(int64(above))))
 			b.WriteString(" ")
 		}
 		if below > 0 {
-			b.WriteString(st.Key.Render("\u2193" + model.Comma(int64(below))))
+			b.WriteString(st.Key.Render("↓" + model.Comma(int64(below))))
 			b.WriteString(" ")
 		}
 	}
@@ -433,30 +441,39 @@ func (m Model) footerRight(st Styles) string {
 // starts at the same offset on every line.
 func helpRows() [][2]string {
 	return [][2]string{
-		{"SPAN  \u2190 \u2192", "VIEW  tab"},
+		{"SPAN  ← →", "VIEW  tab"},
 		{"1 today    4 month", "t  time"},
 		{"2 day      5 year", "p  by project / cwd"},
 		{"3 week     0 all", "M  by model"},
 		{"", "H  hour-of-week heat"},
 		{"", ""},
 		{"ROWS", "FILTER"},
-		{"j k \u2191 \u2193  move", "a  cycle agent"},
+		{"j k ↑ ↓  move", "a  cycle agent"},
 		{"enter    expand row", "A  all agents"},
 		{"E / C    expand all", "m  split by model"},
 		{"g / G    top / end", "s  cycle sort"},
-		{"d        detail", "/  search"},
-		{"c        mascot", "esc  clear"},
+		{"d        detail", "/  search, live"},
+		{"c        mascot", "esc  clear search"},
 		{"r        rescan", ""},
+		{"q        quit", "ctrl+c  quit, anywhere"},
 	}
 }
 
+// helpNotes explain what the screen shows. They are the first thing the
+// overlay drops on a short terminal, so the key bindings never are.
 var helpNotes = []string{
+	"",
+	"search: agent, model or project, any case, ~/ paths;",
+	"  CJK and pastes work; enter keeps it, esc clears it",
+	"the line under the tabs: dates, UTC offset, filters",
+	"OVERVIEW cards ignore the span and the search; their",
+	"  deltas are like for like: today vs yesterday so far",
+	"⚠ some logs were unreadable: totals are a lower bound",
 	"",
 	"totals = input + cache read + cache write + output",
 	"calls  = upstream API requests, not turns",
 	"cache is processed volume, not billed cost",
-	"",
-	"Messages replayed into resumed sessions count once.",
+	"Repeated records (resumed, copied logs) count once.",
 }
 
 // helpLines builds the overlay content. Each line is styled on its own: a
@@ -466,7 +483,7 @@ func helpLines(name string, st Styles, withTitle, withNotes bool) []string {
 	var out []string
 	if withTitle {
 		out = append(out,
-			st.Title.Render(name)+st.Muted.Render(" \u2014 local AI agent token usage"),
+			st.Title.Render(name)+st.Muted.Render(" — local AI agent token usage"),
 			"")
 	}
 	for _, r := range helpRows() {
@@ -631,18 +648,4 @@ func padCol(s string, width int, right bool) string {
 		return padLeft(s, width)
 	}
 	return padRight(s, width)
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

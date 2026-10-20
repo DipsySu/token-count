@@ -108,8 +108,8 @@ func TestPlainPrintsEveryRow(t *testing.T) {
 			if strings.Contains(ln, "└ claude") {
 				children++
 			}
-			if f := strings.Fields(ln); len(f) > 1 && f[0] == "TOTAL" {
-				total, _ = strconv.ParseInt(strings.ReplaceAll(f[1], ",", ""), 10, 64)
+			if f := strings.Fields(ln); len(f) > 2 && f[0] == "RANGE" && f[1] == "TOTAL" {
+				total, _ = strconv.ParseInt(strings.ReplaceAll(f[2], ",", ""), 10, 64)
 			}
 		}
 		if len(printed) != projects {
@@ -262,7 +262,7 @@ func TestPlainHeatUsesTheReportWindow(t *testing.T) {
 	opts := Options{Period: aggregate.PeriodToday, View: aggregate.ViewHeat, Now: testClock}
 	for name, ex := range map[string]Export{"scoped": ScopeExport(recs, opts), "built": BuildExport(recs, opts)} {
 		var buf bytes.Buffer
-		WriteHeat(&buf, ex)
+		WriteHeat(&buf, opts, ex, source.Stats{})
 		if out := stripANSI(buf.String()); !strings.Contains(out, "total 10\n") {
 			t.Errorf("%s: today's plain heatmap should total 10:\n%s", name, out)
 		}
@@ -281,7 +281,7 @@ func TestTUIAndExportAgree(t *testing.T) {
 			opts := Options{Period: p, View: v, Agents: model.Agents, Now: testClock}
 			m := New(opts)
 			m.loading = false
-			m.records = recs
+			m.setRecords(recs)
 			m.recompute()
 			ex := BuildExport(recs, opts)
 

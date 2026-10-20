@@ -156,7 +156,7 @@ func run(name string, args []string) error {
 	case *asJSON:
 		return ui.WriteJSON(os.Stdout, opts, ui.BuildExport(records, opts), stats)
 	case view == aggregate.ViewHeat:
-		ui.WriteHeat(os.Stdout, ui.ScopeExport(records, opts))
+		ui.WriteHeat(os.Stdout, opts, ui.ScopeExport(records, opts), stats)
 	default:
 		ui.WritePlain(os.Stdout, opts, ui.BuildExport(records, opts), stats)
 	}
@@ -263,7 +263,7 @@ OPTIONS
       --until date     YYYY-MM-DD
       --json           machine-readable output
       --plain          table instead of TUI
-      --no-cache       ignore ~/.cache/token-count
+      --no-cache       neither read nor write ~/.cache/token-count
       --no-cat         hide the mascot
   -V, --version
 
@@ -276,8 +276,30 @@ KEYS (TUI)
   a A          agent filter      m         split by model
   s            cycle sort        /         search
   d            detail panel      c         mascot
-  r            rescan
-  ?            help              q         quit
+  r            rescan            ?         help
+  q            quit              ctrl+c    quit, from anywhere
+
+  / searches agent, model and project as you type, in any case, by the
+  names the table shows too: ~/ paths, short model names. CJK input and
+  pasted text work. enter keeps the search, esc clears it.
+
+SCREEN
+  The line under the tabs is the table's scope: its first and last dates,
+  how many days that is, the UTC offset, then any filters (agent, by model,
+  sort, search). The OVERVIEW cards below it ignore the span and the search;
+  each delta compares like for like, e.g. today with yesterday up to the
+  same time. The last row, RANGE TOTAL, sums the table. The screen needs at
+  least 30x10, and moves on to the new day at midnight.
+
+OUTPUT
+  --plain prints every row, under a header naming the span, view, dates,
+  UTC offset and filters. --json reports the effective local dates as
+  since/until with utc_offset; records, calls and the rows cover that
+  window, and heat.total equals the rows. deduped counts the whole load.
+
+  Files that cannot be read completely make the totals a lower bound: the
+  TUI says so in a warning line, --plain lists up to five after the table,
+  and --json sets "complete": false and lists them all under "issues".
 
 ENVIRONMENT
   NO_COLOR             disable all colour
@@ -289,7 +311,8 @@ NOTES
   calls  = upstream API requests, not conversation turns
   cache is processed volume, not billed cost
 
-  Agents replay earlier messages into resumed sessions; those repeats are
-  counted once. Run with --json to see how many were dropped.
+  Agents repeat records: resumed and forked sessions replay history, logs
+  get copied, and Codex publishes some usage twice. Repeats are counted
+  once, the same way on every run. Run with --json to see how many.
 `, "NAME", name)
 }

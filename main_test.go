@@ -227,7 +227,106 @@ func TestRunPlainPrintsEveryProject(t *testing.T) {
 	if len(seen) != n || children != n {
 		t.Errorf("printed %d projects and %d agent rows, want %d of each", len(seen), children, n)
 	}
-	if !regexp.MustCompile(`(?m)^ TOTAL\s+2,200\s`).MatchString(out) {
-		t.Errorf("the TOTAL row should read 2,200")
+	if !regexp.MustCompile(`(?m)^ RANGE TOTAL\s+2,200\s`).MatchString(out) {
+		t.Errorf("the RANGE TOTAL row should read 2,200")
+	}
+}
+
+// brokenLogs points OpenCode at n message files that end after their first
+// byte, as files caught while being rewritten do, and returns their paths in
+// the order a report lists them. A broken file cannot be read whoever runs
+// the suite, root included.
+func brokenLogs(t *testing.T, n int) []string {
+	t.Helper()
+	root := filepath.Join(t.TempDir(), "opencode")
+	t.Setenv("OPENCODE_DATA", root)
+	dir := filepath.Join(root, "storage", "message", "ses_1")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	paths := make([]string, n)
+	for i := range paths {
+		paths[i] = filepath.Join(dir, fmt.Sprintf("msg_%d.json", i))
+		if err := os.WriteFile(paths[i], []byte("{"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return paths
+}
+
+// Files that could not be read make every report short, and every report
+// says so: --json in two fields, the table and the heatmap after what they
+// print, naming the first five files and counting the rest. A report used to
+// look complete however many files it had skipped.
+func TestRunReportsIncompleteReads(t *testing.T) {
+	pinTime(t, time.Date(2026, 8, 25, 15, 0, 0, 0, testZone))
+	projects := isolate(t)
+	claudeSession(t, projects, response{"/w/a", time.Date(2026, 8, 25, 10, 0, 0, 0, testZone), 10})
+	broken := brokenLogs(t, 7)
+
+	var rep map[string]any
+	if out := capture(t, "--json", "--no-cache"); json.Unmarshal([]byte(out), &rep) != nil {
+		t.Fatalf("not JSON:\n%s", out)
+	}
+	issues, _ := rep["issues"].([]any)
+	if rep["complete"] != false || len(issues) != len(broken) {
+		t.Fatalf("complete %v with %d issues, want false with %d", rep["complete"], len(issues), len(broken))
+	}
+	if first, _ := issues[0].(map[string]any); first["agent"] != "opencode" || first["path"] != broken[0] ||
+		!strings.HasPrefix(fmt.Sprint(first["error"]), "malformed JSON") {
+		t.Errorf("first issue %v", first)
+	}
+
+	for _, args := range [][]string{{"--plain"}, {"today", "hours"}} {
+		out := capture(t, append(args, "--no-cache")...)
+		if !strings.Contains(out, "⚠ 7 files could not be read completely — totals are a lower bound") {
+			t.Errorf("%v: no warning:\n%s", args, out)
+		}
+		for i, p := range broken {
+			if listed := strings.Contains(out, "opencode  "+p+": malformed JSON"); listed != (i < 5) {
+				t.Errorf("%v: %s listed %v, want %v", args, p, listed, i < 5)
+			}
+		}
+		if !strings.Contains(out, "… and 2 more (see --json)") {
+			t.Errorf("%v: the files beyond five are not counted:\n%s", args, out)
+		}
+	}
+
+	// Once every file reads, the reports say they are complete.
+	for _, p := range broken {
+		if err := os.Remove(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rep = nil
+	if out := capture(t, "--json", "--no-cache"); json.Unmarshal([]byte(out), &rep) != nil {
+		t.Fatalf("not JSON:\n%s", out)
+	}
+	if _, listed := rep["issues"]; rep["complete"] != true || listed {
+		t.Errorf("complete %v, issues %v; want true and none", rep["complete"], rep["issues"])
+	}
+	if out := capture(t, "--plain", "--no-cache"); strings.Contains(out, "⚠") {
+		t.Errorf("a complete --plain warns:\n%s", out)
+	}
+}
+
+// The heatmap opens with the header the table has: what it covers, from
+// when to when, in which zone, for which agents.
+func TestRunHeatmapNamesItsWindow(t *testing.T) {
+	pinTime(t, time.Date(2026, 8, 25, 15, 0, 0, 0, testZone))
+	projects := isolate(t)
+	claudeSession(t, projects, response{"/w/a", time.Date(2026, 8, 25, 10, 0, 0, 0, testZone), 10})
+	for _, c := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"today", "hours"}, "tcount  ·  today  ·  hours  ·  2026-08-25  ·  UTC+08:00"},
+		{[]string{"day", "hours", "-a", "claude,codex"},
+			"tcount  ·  day  ·  hours  ·  2026-08-12 → 2026-08-25  ·  UTC+08:00  ·  claude,codex"},
+	} {
+		out := capture(t, append(c.args, "--no-cache")...)
+		if got := strings.TrimRight(strings.SplitN(out, "\n", 2)[0], " "); got != c.want {
+			t.Errorf("%v: header\n %q, want\n %q", c.args, got, c.want)
+		}
 	}
 }

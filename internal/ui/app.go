@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/textinput"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"token-count/internal/aggregate"
@@ -45,10 +46,21 @@ type loadedMsg struct {
 	records []model.Usage
 	dropped int
 	dupToks int64
-	err     error
+	// issues are the files the load could not read completely. They replace
+	// the previous load's, since a rescan reads every file again.
+	issues []source.Issue
+	err    error
 }
 
 type tickMsg time.Time
+
+// clockMsg is the slow tick on which the TUI notices that the local date has
+// changed while it stayed open.
+type clockMsg time.Time
+
+// clockEvery is how often the TUI looks at the date. Midnight is the only
+// moment it waits for, so a look every half minute is plenty.
+const clockEvery = 30 * time.Second
 
 var spinner = []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
 
@@ -84,25 +96,40 @@ type Model struct {
 	agent   string
 	byModel bool
 
-	records  []model.Usage
+	// records are the load's records. They are only ever replaced through
+	// setRecords, which bumps gen, so that nothing worked out from one load
+	// is served for the next.
+	records []model.Usage
+	gen     int
+	ix      *searchIndex
+
 	scoped   []model.Usage
 	rows     []model.Bucket
 	flat     []model.Bucket
 	snapshot map[string]aggregate.Snap
-	heat     aggregate.Heat
-	open     map[string]bool
+	// peak is the busiest single day in the snapshot, the yardstick for the
+	// mascot's mood and the card hues. Both are drawn on every frame, so
+	// they are worked out with the snapshot rather than for each frame.
+	peak int64
+	mood catMood
+	heat aggregate.Heat
+	open map[string]bool
 
 	// asOf is the instant the figures on screen were computed against, and
 	// since/until the window it gave the table (nil leaves a side open).
 	// Rendering reads these instead of the clock, so everything drawn
-	// describes the same moment.
+	// describes the same moment. first is the earliest record in that window
+	// for the agent filter, zero when there is none: it names the start of a
+	// window that has no start of its own.
 	asOf         time.Time
 	since, until *time.Time
+	first        time.Time
 
-	sort    sortKey
-	search  string
-	seeking bool
-	cat     bool
+	sort   sortKey
+	search string
+	// input is the search box; it has the keyboard while it is focused.
+	input textinput.Model
+	cat   bool
 
 	cursor  int
 	offset  int
@@ -114,6 +141,9 @@ type Model struct {
 
 	dropped int
 	dupToks int64
+	issues  []source.Issue
+
+	memo *memo
 }
 
 func RunTUI(opts Options) error {
@@ -146,13 +176,19 @@ func New(opts Options) Model {
 		cat:      !opts.NoCat,
 		open:     map[string]bool{},
 		snapshot: map[string]aggregate.Snap{},
+		input:    newSearchInput(),
+		memo:     &memo{},
 	}
 }
 
-func (m Model) Init() tea.Cmd { return tea.Batch(m.load(), tick()) }
+func (m Model) Init() tea.Cmd { return tea.Batch(m.load(), tick(), clockTick()) }
 
 func tick() tea.Cmd {
 	return tea.Tick(90*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+}
+
+func clockTick() tea.Cmd {
+	return tea.Tick(clockEvery, func(t time.Time) tea.Msg { return clockMsg(t) })
 }
 
 func (m Model) load() tea.Cmd {
@@ -161,8 +197,17 @@ func (m Model) load() tea.Cmd {
 		c := cache.New("", !opts.NoCache)
 		recs, stats := source.CollectStats(opts.Agents, c, nil)
 		_ = c.Save()
-		return loadedMsg{records: recs, dropped: stats.Dropped, dupToks: stats.DroppedTokens}
+		return loadedMsg{records: recs, dropped: stats.Dropped, dupToks: stats.DroppedTokens, issues: stats.Issues}
 	}
+}
+
+// setRecords replaces the records, as a load does. It bumps the generation,
+// so that nothing worked out from the old records is served again, and
+// indexes the new ones for searching.
+func (m *Model) setRecords(recs []model.Usage) {
+	m.records = recs
+	m.gen++
+	m.ix = newSearchIndex(recs)
 }
 
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -182,13 +227,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tick()
 		}
 
+	case clockMsg:
+		// The figures describe the day they were computed on. Once the local
+		// date moves on, an open TUI would go on calling yesterday's figures
+		// today's. A scan under way will bring them up to date when it ends.
+		if !m.loading && m.gen > 0 && !aggregate.Day(m.opts.now()).Equal(aggregate.Day(m.asOf)) {
+			m.refresh()
+		}
+		return m, clockTick()
+
 	case loadedMsg:
 		m.loading = false
 		m.err = msg.err
-		m.records = msg.records
+		m.setRecords(msg.records)
 		m.dropped = msg.dropped
 		m.dupToks = msg.dupToks
-		m.recompute()
+		m.issues = msg.issues
+		m.refresh()
 
 	case tea.MouseMsg:
 		switch msg.Button {
@@ -207,29 +262,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	key := msg.String()
-
-	if m.seeking {
-		switch key {
-		case "esc":
-			m.seeking, m.search = false, ""
-			m.recompute()
-		case "enter":
-			m.seeking = false
-		case "backspace":
-			if m.search != "" {
-				m.search = m.search[:len(m.search)-1]
-				m.recompute()
-			}
-		default:
-			if len(key) == 1 {
-				m.search += key
-				m.recompute()
-			}
-		}
-		return m, nil
+	// ctrl+c is the way out whatever has the keyboard. The search box and
+	// the help overlay used to take it as an ordinary key, which left esc as
+	// the only way out of them.
+	if msg.Type == tea.KeyCtrlC {
+		return m, tea.Quit
+	}
+	if m.input.Focused() {
+		return m.onSearchKey(msg)
 	}
 
+	key := msg.String()
 	if m.help {
 		if key == "q" || key == "esc" || key == "?" {
 			m.help = false
@@ -238,20 +281,24 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	switch key {
-	case "q", "ctrl+c":
+	case "q":
 		return m, tea.Quit
 	case "?":
 		m.help = true
 	case "esc":
 		switch {
 		case m.search != "":
-			m.search = ""
-			m.recompute()
+			m.setSearch("")
 		case m.detail:
 			m.detail = false
+			m.clamp()
 		}
 	case "/":
-		m.seeking = true
+		// The box opens on the search in force, to be edited rather than
+		// typed again.
+		m.input.SetValue(m.search)
+		m.input.CursorEnd()
+		return m, m.input.Focus()
 	case "r":
 		m.loading = true
 		return m, tea.Batch(m.load(), tick())
@@ -290,13 +337,13 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cycleAgent(1)
 	case "A":
 		m.agent = ""
-		m.reset()
+		m.refresh()
 	case "m":
 		m.byModel = !m.byModel
-		m.reset()
+		m.refresh()
 	case "s":
 		m.sort = (m.sort + 1) % 4
-		m.reset()
+		m.refresh()
 	case "d":
 		m.detail = !m.detail
 		m.clamp()
@@ -331,6 +378,47 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.clamp()
 	}
 	return m, nil
+}
+
+// onSearchKey handles a key while the search box has the keyboard. Enter
+// keeps the search and hands the keys back to the table; esc clears it. Every
+// other key, letters included, is the box's: an edit, which applies at once,
+// or a cursor movement.
+func (m Model) onSearchKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyEnter:
+		m.input.Blur()
+		if searchTerm(m.search) == "" {
+			// Nothing but spaces matches everything; keeping it would leave
+			// the box holding a search that the scope line cannot show.
+			m.input.Reset()
+			m.search = ""
+		}
+		return m, nil
+	case tea.KeyEsc:
+		m.input.Blur()
+		m.input.Reset()
+		m.setSearch("")
+		return m, nil
+	}
+	if msg.Paste {
+		msg.Runes = pasted(msg.Runes)
+	}
+	var cmd tea.Cmd
+	m.input, cmd = m.input.Update(msg)
+	m.setSearch(m.input.Value())
+	return m, cmd
+}
+
+// setSearch applies a search, keeping the selected row where it can. An edit
+// that changes only spaces at either end leaves the term matched the same,
+// and the table as it is.
+func (m *Model) setSearch(s string) {
+	same := searchTerm(s) == searchTerm(m.search)
+	m.search = s
+	if !same {
+		m.refresh()
+	}
 }
 
 func (m *Model) setPeriod(p aggregate.Period) {
@@ -369,9 +457,19 @@ func (m *Model) setView(v aggregate.View) {
 	m.reset()
 }
 
+// reset recomputes for a new span or view. That is another table altogether,
+// so the selection starts again at the top.
 func (m *Model) reset() {
 	m.cursor, m.offset = 0, 0
 	m.recompute()
+}
+
+// refresh recomputes the same table under changed filters, data, sort or
+// date, keeping the selection on the row it was on.
+func (m *Model) refresh() {
+	sel := m.selection()
+	m.recompute()
+	m.reselect(sel)
 }
 
 func (m *Model) cycleAgent(delta int) {
@@ -384,7 +482,7 @@ func (m *Model) cycleAgent(delta int) {
 		}
 	}
 	m.agent = names[(idx+delta+len(names))%len(names)]
-	m.reset()
+	m.refresh()
 }
 
 func (m *Model) toggleOpen() {
@@ -400,13 +498,79 @@ func (m *Model) toggleOpen() {
 	m.clamp()
 }
 
+// setAllOpen expands or collapses every row. A selected breakdown row that
+// collapses away hands the selection to its parent.
 func (m *Model) setAllOpen(v bool) {
+	sel := m.selection()
 	for _, r := range m.rows {
 		if len(r.Children) > 0 {
 			m.open[r.Key] = v
 		}
 	}
 	m.flat = aggregate.Flatten(m.rows, m.open)
+	m.reselect(sel)
+}
+
+// selection identifies the selected row by its key and its parent's, so that
+// it can be found again once the rows have been rebuilt around it. Keys are
+// unique among top-level rows, and a breakdown row's key is unique under its
+// parent.
+type selection struct {
+	key, parent string // parent is "" for a top-level row
+	ok          bool   // a row was selected at all
+	index       int    // where it was
+	screen      int    // how far below the first visible row it was
+}
+
+func (m *Model) selection() selection {
+	sel := selection{index: m.cursor, screen: m.cursor - m.offset}
+	if m.cursor < 0 || m.cursor >= len(m.flat) {
+		return sel
+	}
+	sel.ok, sel.key = true, m.flat[m.cursor].Key
+	if m.flat[m.cursor].Depth > 0 {
+		for i := m.cursor - 1; i >= 0; i-- {
+			if m.flat[i].Depth == 0 {
+				sel.parent = m.flat[i].Key
+				break
+			}
+		}
+	}
+	return sel
+}
+
+// reselect moves the cursor to the row sel names: the row itself while it is
+// still listed, else its parent, else whatever now sits where it was. The row
+// keeps its place on screen as far as the scroll range allows, so that a sort
+// or a filter does not make the table jump under the reader, and clamp keeps
+// it visible.
+func (m *Model) reselect(sel selection) {
+	at := sel.index
+	if sel.ok {
+		found, parent := -1, -1
+		top := "" // the key of the latest top-level row
+		for i, b := range m.flat {
+			under := top
+			if b.Depth == 0 {
+				under, top = "", b.Key
+				if parent < 0 && sel.parent != "" && b.Key == sel.parent {
+					parent = i
+				}
+			}
+			if b.Key == sel.key && under == sel.parent {
+				found = i
+				break
+			}
+		}
+		switch {
+		case found >= 0:
+			at = found
+		case parent >= 0:
+			at = parent
+		}
+	}
+	m.cursor = at
+	m.offset = at - sel.screen
 	m.clamp()
 }
 
@@ -422,6 +586,9 @@ func window(opts Options, period aggregate.Period, now time.Time) (since, until 
 	return aggregate.PeriodBounds(period, now)
 }
 
+// dateLayout is how a calendar date is printed everywhere.
+const dateLayout = "2006-01-02"
+
 // windowDates names the first and last calendar dates a window admits, as
 // YYYY-MM-DD; an open side is "". Anything that prints a window should use
 // it, because formatting a bound names the wrong day in some zones. A bound
@@ -434,13 +601,12 @@ func window(opts Options, period aggregate.Period, now time.Time) (since, until 
 // whose midnight is not before it, and until those whose midnight is not
 // after it.
 func windowDates(since, until *time.Time) (first, last string) {
-	const layout = "2006-01-02"
 	if since != nil {
 		d := civilDate(*since)
 		for localMidnight(d).Before(*since) {
 			d = d.AddDate(0, 0, 1)
 		}
-		first = d.Format(layout)
+		first = d.Format(dateLayout)
 	}
 	if until != nil {
 		// The bound can stand for the day after its own, when that day's
@@ -449,7 +615,7 @@ func windowDates(since, until *time.Time) (first, last string) {
 		for localMidnight(d).After(*until) {
 			d = d.AddDate(0, 0, -1)
 		}
-		last = d.Format(layout)
+		last = d.Format(dateLayout)
 	}
 	return first, last
 }
@@ -486,39 +652,21 @@ func group(recs []model.Usage, view aggregate.View, period aggregate.Period, byM
 	return aggregate.GroupTime(recs, period, byModel)
 }
 
-// scope narrows the full record set to what the agent filter, the current
-// window and the search term select.
-func (m *Model) scope() []model.Usage {
-	recs := aggregate.Filter(aggregate.FilterAgent(m.records, m.agent), m.since, m.until)
-	if q := strings.ToLower(strings.TrimSpace(m.search)); q != "" {
-		out := recs[:0:0]
-		for _, r := range recs {
-			if strings.Contains(strings.ToLower(r.Agent), q) ||
-				strings.Contains(strings.ToLower(r.Model), q) ||
-				strings.Contains(strings.ToLower(r.Project), q) {
-				out = append(out, r)
-			}
-		}
-		recs = out
-	}
-	return recs
-}
-
 func (m *Model) recompute() {
+	if m.memo == nil {
+		m.memo = &memo{}
+	}
 	// The clock is read once, and the cards, the window and the title bar
 	// all use that one instant even if the recompute runs across midnight.
 	m.asOf = m.opts.now()
-
-	// Cards always describe the unfiltered-by-period picture so they stay a
-	// stable reference while the table below changes shape.
-	base := aggregate.FilterAgent(m.records, m.agent)
-	if m.opts.Since != nil || m.opts.Until != nil {
-		base = aggregate.Filter(base, m.opts.Since, m.opts.Until)
-	}
-	m.snapshot = aggregate.Snapshot(base, m.asOf)
-
 	m.since, m.until = window(m.opts, m.period, m.asOf)
-	m.scoped = m.scope()
+
+	c := m.figures()
+	m.snapshot, m.peak, m.mood = c.snap, c.peak, c.mood
+
+	b := m.scopeBase()
+	m.first = b.first
+	m.scoped = m.narrow(b)
 
 	if m.view == aggregate.ViewHeat {
 		m.heat = aggregate.Heatmap(m.scoped)
@@ -552,44 +700,8 @@ func (m *Model) applySort() {
 	}
 }
 
-// bodyRows is how many table lines fit, given everything else on screen.
-func (m *Model) bodyRows() int {
-	n := m.height - m.chromeHeight()
-	if n < 3 {
-		n = 3
-	}
-	return n
-}
-
-// chromeHeight counts every line the table does not get: header, tabs, cards,
-// column titles, rule, total row and footer.
-func (m *Model) chromeHeight() int {
-	h := 2 // title + tabs
-	if m.showCards() {
-		h += 5 // blank + label + value + spark + delta
-	}
-	h += 3 // blank, column header, rule
-	h += 2 // total row + footer
-	if m.detail {
-		h += detailHeight
-	}
-	if m.notice() != "" {
-		h++
-	}
-	return h
-}
-
-func (m *Model) showCards() bool { return m.height >= 22 && m.width >= 60 }
-
-// notice surfaces the deduplication result, which explains why these totals
-// are lower than a naive count of the session logs.
-func (m Model) notice() string {
-	if m.loading || m.dropped == 0 {
-		return ""
-	}
-	return "deduped " + model.Comma(int64(m.dropped)) + " replayed records (" +
-		model.FmtTokens(m.dupToks) + " tokens) — Claude Code rewrites history on resume"
-}
+// bodyRows is how many table rows fit, given everything else on screen.
+func (m *Model) bodyRows() int { return max(m.layout().body, 1) }
 
 func (m *Model) clamp() {
 	n := len(m.flat)
@@ -655,3 +767,7 @@ func agentLabel(name string) string {
 	}
 	return name
 }
+
+// trimmedSearch is the search as the scope line and the empty table quote
+// it: without the spaces at either end, which do not count.
+func (m Model) trimmedSearch() string { return strings.TrimSpace(m.search) }

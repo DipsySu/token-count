@@ -13,7 +13,7 @@ import (
 // environment, which a test binary has no terminal to inspect; and lipgloss
 // independently downgrades colours to nothing when its profile says the output
 // cannot show them, which is the case when stdout is a pipe.
-func withFancy(t *testing.T, on bool) {
+func withFancy(t testing.TB, on bool) {
 	t.Helper()
 	fancyEnabled() // let the real detection settle before overriding it
 	prevOn := fancyOn

@@ -26,13 +26,13 @@ func testClock() time.Time { return testNow }
 
 // pinLocal makes testZone the local zone until the test ends. Records must be
 // made after it is pinned, because model.Make converts them to local time.
-func pinLocal(t *testing.T) {
+func pinLocal(t testing.TB) {
 	t.Helper()
 	pinZone(t, testZone)
 }
 
 // pinZone makes loc the local zone until the test ends.
-func pinZone(t *testing.T, loc *time.Location) {
+func pinZone(t testing.TB, loc *time.Location) {
 	t.Helper()
 	if time.Local == loc {
 		return
@@ -74,7 +74,7 @@ func newTestModel(t *testing.T, w, h int) Model {
 	m := New(Options{Period: aggregate.PeriodDay, Agents: model.Agents, Version: "test", Now: testClock})
 	m.width, m.height = w, h
 	m.loading = false
-	m.records = sample(testNow)
+	m.setRecords(sample(testNow))
 	m.recompute()
 	return m
 }
@@ -174,7 +174,7 @@ func TestByModelKeepsTheModelColumn(t *testing.T) {
 			m := New(Options{Period: p, Agents: model.Agents, ByModel: true, Now: testClock})
 			m.width, m.height = w, 30
 			m.loading = false
-			m.records = recs
+			m.setRecords(recs)
 			m.recompute()
 			m.setAllOpen(true)
 			lines := m.tableView(w, newStyles())
@@ -367,8 +367,9 @@ func TestMascotYieldsOnNarrowTerminals(t *testing.T) {
 	if !m.showCat() {
 		t.Fatal("mascot should appear when there is room")
 	}
-	// It also has to yield when there is no vertical room for the cards.
-	m = newTestModel(t, 100, 18)
+	// It also has to yield when there is no vertical room for the cards,
+	// which go before the table has fewer than its four rows.
+	m = newTestModel(t, 100, 16)
 	if m.showCat() {
 		t.Fatal("mascot appeared without the cards it aligns to")
 	}
@@ -529,7 +530,7 @@ func TestInvokedNameReachesTheUI(t *testing.T) {
 		m := New(Options{Agents: model.Agents, Name: name, Version: "0.3.0", Now: testClock})
 		m.width, m.height = 110, 30
 		m.loading = false
-		m.records = sample(testNow)
+		m.setRecords(sample(testNow))
 		m.recompute()
 
 		if got := stripANSI(m.titleBar(m.width, newStyles())); !strings.Contains(got, name) {

@@ -20,7 +20,7 @@ func TestInjectedClockDecidesToday(t *testing.T) {
 	m := New(Options{Period: aggregate.PeriodToday, Agents: model.Agents, Now: testClock})
 	m.width, m.height = 120, 30
 	m.loading = false
-	m.records = recs
+	m.setRecords(recs)
 	m.recompute()
 	if got := len(m.scoped); got != 3 {
 		t.Errorf("TUI scoped %d records to today, want 3", got)
@@ -62,7 +62,7 @@ func TestClockIsReadOncePerComputation(t *testing.T) {
 	m := New(Options{Period: aggregate.PeriodToday, Agents: model.Agents, Now: clock})
 	m.width, m.height = 120, 30
 	m.loading = false
-	m.records = sample(testNow)
+	m.setRecords(sample(testNow))
 	m.recompute()
 	if reads != 1 {
 		t.Fatalf("recompute read the clock %d times", reads)
@@ -85,13 +85,13 @@ func TestClockIsReadOncePerComputation(t *testing.T) {
 			t.Fatal(err)
 		}
 		WritePlain(&buf, opts, ex, source.Stats{})
-		WriteHeat(&buf, ex)
+		WriteHeat(&buf, opts, ex, source.Stats{})
 		if reads != 1 {
 			t.Errorf("%s export read the clock %d times", view, reads)
 		}
 
 		reads = 0
-		WriteHeat(&buf, ScopeExport(sample(testNow), opts))
+		WriteHeat(&buf, opts, ScopeExport(sample(testNow), opts), source.Stats{})
 		if reads != 1 {
 			t.Errorf("%s scoped export read the clock %d times", view, reads)
 		}

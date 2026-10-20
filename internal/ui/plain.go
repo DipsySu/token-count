@@ -33,6 +33,10 @@ func ShouldTUI(plain, asJSON bool) bool {
 // no bound is omitted. UTCOffset is the local offset at Date, when the report
 // was made. A window that crosses a daylight-saving change began under a
 // different offset, so it is not the offset of every date in the window.
+// Deduped counts the whole load, not just the window.
+//
+// Complete is false when some files could not be read completely, which
+// makes every figure a lower bound; Issues then names them.
 type Report struct {
 	Period    string               `json:"period"`
 	View      string               `json:"view"`
@@ -46,6 +50,8 @@ type Report struct {
 	Records   int                  `json:"records"`
 	Calls     int64                `json:"calls"`
 	Deduped   ReportDedup          `json:"deduped"`
+	Complete  bool                 `json:"complete"`
+	Issues    []source.Issue       `json:"issues,omitempty"`
 }
 
 // ReportHeat is the hour-of-week grid, emitted only for the heat view. Rows
@@ -218,6 +224,8 @@ func WriteJSON(w io.Writer, opts Options, ex Export, stats source.Stats) error {
 		Records:   len(ex.Records),
 		Calls:     calls,
 		Deduped:   ReportDedup{Dropped: stats.Dropped, DroppedTokens: stats.DroppedTokens},
+		Complete:  len(stats.Issues) == 0,
+		Issues:    stats.Issues,
 	})
 }
 
@@ -243,6 +251,58 @@ var exportWidth = func() int {
 	return 100
 }
 
+// plainHeader is the first line of a text export: what it covers, from when
+// to when, in which zone, and what narrowed it, as the TUI's tab bar and
+// scope line say.
+func plainHeader(st Styles, opts Options, ex Export) string {
+	view := opts.View
+	if view == "" {
+		view = aggregate.ViewTime
+	}
+	var first time.Time
+	for i := range ex.Records {
+		if t := ex.Records[i].Time; first.IsZero() || t.Before(first) {
+			first = t
+		}
+	}
+	parts := []string{
+		string(opts.Period),
+		viewLabel(view),
+		describeWindow(ex.Since, ex.Until, first, ex.Now).short,
+		utcOffset(ex.Now),
+	}
+	if agents := agentSubset(opts.Agents); agents != "" {
+		parts = append(parts, agents)
+	}
+	if opts.ByModel {
+		parts = append(parts, "by model")
+	}
+	return st.Title.Render(displayName(opts.Name)) + st.Muted.Render("  ·  "+strings.Join(parts, "  ·  "))
+}
+
+// writeIssues warns, after what a text export printed, that the figures in
+// it are a lower bound, naming the first few files that could not be read
+// completely; --json lists them all.
+func writeIssues(w io.Writer, st Styles, issues []source.Issue) {
+	if len(issues) == 0 {
+		return
+	}
+	const shown = 5
+	fmt.Fprintln(w)
+	fmt.Fprintln(w, st.Warn.Render(" ⚠ "+plural(len(issues), "file")+
+		" could not be read completely — totals are a lower bound"))
+	agentW := 0
+	for _, is := range issues[:min(shown, len(issues))] {
+		agentW = max(agentW, ansi.StringWidth(is.Agent))
+	}
+	for _, is := range issues[:min(shown, len(issues))] {
+		fmt.Fprintln(w, st.Warn.Render("   "+padRight(is.Agent, agentW)+"  "+is.Path+": "+is.Err))
+	}
+	if more := len(issues) - shown; more > 0 {
+		fmt.Fprintln(w, st.Warn.Render(fmt.Sprintf("   … and %s more (see --json)", model.Comma(int64(more)))))
+	}
+}
+
 // WritePlain prints the same table the TUI shows, without the chrome, by
 // driving the shared renderer with every group expanded and every row drawn.
 // Like WriteJSON, it needs an export from BuildExport.
@@ -254,16 +314,17 @@ func WritePlain(w io.Writer, opts Options, ex Export, stats source.Stats) {
 	if view == "" {
 		view = aggregate.ViewTime
 	}
-	fmt.Fprintln(w, st.Title.Render(displayName(opts.Name))+
-		st.Muted.Render("  ·  "+string(opts.Period)+"  ·  "+string(view)+"  ·  "+ex.Now.In(time.Local).Format("2006-01-02")))
+	fmt.Fprintln(w, plainHeader(st, opts, ex))
 	fmt.Fprintln(w)
 
+	// The cards keep their own scope, as in the TUI, so they are labelled as
+	// the overview they are rather than read as a total of the table.
 	var parts []string
 	for _, key := range []string{"today", "week", "month", "year"} {
 		t := ex.Snap[key].Totals
 		parts = append(parts, st.Faint.Render(strings.ToUpper(key)+" ")+st.Total.Render(model.FmtTokens(t.Total())))
 	}
-	fmt.Fprintln(w, " "+strings.Join(parts, "    "))
+	fmt.Fprintln(w, " "+st.Faint.Render("overview")+"  "+strings.Join(parts, "    "))
 	fmt.Fprintln(w)
 
 	open := map[string]bool{}
@@ -290,12 +351,14 @@ func WritePlain(w io.Writer, opts Options, ex Export, stats source.Stats) {
 		fmt.Fprintln(w, line)
 	}
 
+	writeIssues(w, st, stats.Issues)
+
 	fmt.Fprintln(w)
 	fmt.Fprintln(w, st.Faint.Render(" total = input + cache.r + cache.w + output   ·   calls = upstream API requests"))
 	if stats.Dropped > 0 {
 		fmt.Fprintln(w, st.Faint.Render(fmt.Sprintf(
-			" deduped %s replayed records (%s tokens) that agents rewrote into resumed sessions",
-			model.Comma(int64(stats.Dropped)), model.FmtTokens(stats.DroppedTokens))))
+			" deduped %s (%s tokens) that resumed sessions and copied logs repeat",
+			plural(stats.Dropped, "repeated record"), model.FmtTokens(stats.DroppedTokens))))
 	}
 }
 
@@ -306,15 +369,19 @@ func WritePlain(w io.Writer, opts Options, ex Export, stats source.Stats) {
 func stripANSI(s string) string { return ansi.Strip(s) }
 
 // WriteHeat prints the hour-of-week grid for the export's window, the same
-// records its rows and counts are drawn from. It reads only the records, so
-// an export from ScopeExport is enough.
-func WriteHeat(w io.Writer, ex Export) {
+// records its rows and counts are drawn from, under the header the table
+// has, and warns after it when some files could not be read completely. It
+// reads only the records, so an export from ScopeExport is enough.
+func WriteHeat(w io.Writer, opts Options, ex Export, stats source.Stats) {
 	st := newStyles()
 	width := exportWidth()
+	fmt.Fprintln(w, plainHeader(st, opts, ex))
+	fmt.Fprintln(w)
 	m := Model{heat: aggregate.Heatmap(ex.Records), width: width}
 	for _, line := range m.heatView(width, st) {
 		fmt.Fprintln(w, line)
 	}
+	writeIssues(w, st, stats.Issues)
 }
 
 // displayName falls back to the default when no invoked name was threaded

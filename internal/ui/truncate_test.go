@@ -9,9 +9,11 @@ import (
 	"testing"
 	"unicode/utf8"
 
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
 	"token-count/internal/aggregate"
+	"token-count/internal/source"
 )
 
 // sgrAt matches one complete SGR sequence at the start of a string; termenv
@@ -169,9 +171,11 @@ type screen struct {
 }
 
 // screens is every state the screen can be in at one size: each view, with
-// and without the detail panel, the search and help overlays, the scan, an
-// empty result for each reason the table can give, the dedup notice and an
-// error.
+// and without the detail panel, the search box with a short and a long term,
+// every filter at once, the help overlay, the scan before and after the first
+// load, an empty result for each reason the table can give, the dedup notice,
+// the incomplete-read warning with everything else that competes for the
+// lines, and an error.
 func screens(t *testing.T, w, h int) []screen {
 	t.Helper()
 	var out []screen
@@ -188,10 +192,15 @@ func screens(t *testing.T, w, h int) []screen {
 			add(string(view)+" with detail", func(m *Model) { m.view, m.detail = view, true })
 		}
 	}
-	add("searching", func(m *Model) { m.seeking, m.search = true, "claude" })
+	add("searching", func(m *Model) { *m = send(*m, runes("/"), runes("claude")) })
+	add("searching, long term", func(m *Model) { *m = send(*m, runes("/"), runes(strings.Repeat("中x", 40))) })
+	add("filters", func(m *Model) {
+		*m = send(*m, runes("a"), runes("m"), runes("s"), runes("/"), runes("claude-model"), key(tea.KeyEnter))
+	})
 	add("help", func(m *Model) { m.help = true })
 	add("scanning", func(m *Model) { m.loading, m.spin = true, 4 })
-	add("no records", func(m *Model) { m.records = nil })
+	add("first scan", func(m *Model) { *m = New(m.opts); m.width, m.height = w, h })
+	add("no records", func(m *Model) { m.setRecords(nil) })
 	add("no records, hours", func(m *Model) { m.records, m.view = nil, aggregate.ViewHeat })
 	add("search miss", func(m *Model) { m.search = "no-such-project-anywhere-in-the-logs-" + strings.Repeat("x", 48) })
 	add("agent without usage", func(m *Model) { m.agent = "gemini" })
@@ -200,6 +209,11 @@ func screens(t *testing.T, w, h int) []screen {
 		m.opts.Since = &future
 	})
 	add("dedup notice", func(m *Model) { m.dropped, m.dupToks = 1_234_567, 98_765_432_100 })
+	add("incomplete reads", func(m *Model) {
+		m.dropped, m.dupToks, m.detail = 3, 1000, true
+		m.issues = []source.Issue{{Agent: "codex", Path: "/home/u/.codex/sessions/x.jsonl", Err: "read: input/output error"}}
+		m.setAllOpen(true)
+	})
 	add("error", func(m *Model) {
 		m.err = errors.New("open /home/u/.claude/projects/-home-u-a-long-project/session.jsonl: permission denied")
 	})

@@ -133,20 +133,41 @@ func colWidth(cols []col, id string) int {
 }
 
 // tableView is the table as the TUI shows it: the screenful of rows that fits
-// between the chrome, scrolled to keep the cursor in view.
+// between the chrome, scrolled to keep the cursor in view, under a rule when
+// the layout has room for one.
 func (m Model) tableView(width int, st Styles) []string {
-	end := min(m.offset+m.bodyRows(), len(m.flat))
-	return m.renderTable(width, st, min(m.offset, end), end)
+	l := m.layout()
+	cols := fitColumns(m.columns(), width)
+	out := []string{m.tableHeader(cols, st)}
+	if l.rule {
+		out = append(out, st.Rule.Render(strings.Repeat("─", max(0, width))))
+	}
+	if len(m.flat) == 0 {
+		return append(out, m.emptyFit(width, st, l.body)...)
+	}
+	end := min(m.offset+max(l.body, 1), len(m.flat))
+	return append(m.tableRows(out, cols, st, min(m.offset, end), end), m.totalRow(cols, st, width))
 }
 
 // renderTable draws the column header, rows [start, end) of the flattened
 // table, and the total. The total always sums every row, so which rows are
-// drawn is the caller's explicit choice: the TUI passes one screenful, while a
-// text export passes all of them. An export that stopped at some screen
-// height while its TOTAL still counted everything would be silently wrong.
+// drawn is the caller's explicit choice: a text export passes all of them. An
+// export that stopped at some screen height while its TOTAL still counted
+// everything would be silently wrong.
 func (m Model) renderTable(width int, st Styles, start, end int) []string {
 	cols := fitColumns(m.columns(), width)
+	out := []string{
+		m.tableHeader(cols, st),
+		st.Rule.Render(strings.Repeat("─", max(0, width))),
+	}
+	if len(m.flat) == 0 {
+		return append(out, m.emptyState(width, st)...)
+	}
+	return append(m.tableRows(out, cols, st, start, end), m.totalRow(cols, st, width))
+}
 
+// tableHeader is the line of column titles.
+func (m Model) tableHeader(cols []col, st Styles) string {
 	head := make([]string, 0, len(cols))
 	for _, c := range cols {
 		title := c.title
@@ -155,15 +176,14 @@ func (m Model) renderTable(width int, st Styles, start, end int) []string {
 		}
 		head = append(head, padCol(title, c.width, c.right))
 	}
-	out := []string{
-		st.Header.Render(" " + strings.Join(head, " ")),
-		st.Rule.Render(strings.Repeat("─", max(0, width))),
-	}
+	return st.Header.Render(" " + strings.Join(head, " "))
+}
 
-	if len(m.flat) == 0 {
-		return append(out, m.emptyState(width, st)...)
-	}
-
+// tableRows appends rows [start, end) of the flattened table to out. The
+// total row, which the callers add, sits directly under the last of them so
+// the two read together; any leftover height is absorbed below it. How many
+// rows are off-screen is reported in the footer, which always has room for it.
+func (m Model) tableRows(out []string, cols []col, st Styles, start, end int) []string {
 	// Every bar shares one scale, set by the largest top-level row. A child
 	// therefore reads as a real fraction of the whole table rather than being
 	// rescaled against its siblings.
@@ -173,26 +193,19 @@ func (m Model) renderTable(width int, st Styles, start, end int) []string {
 			scale = b.Totals.Total()
 		}
 	}
-
 	for i := start; i < end; i++ {
 		out = append(out, m.renderRow(m.flat[i], cols, scale, st, i == m.cursor))
 	}
-
-	// The total sits directly under the last row so the two read together;
-	// any leftover height is absorbed below it. How many rows are off-screen
-	// is reported in the footer, which always has room for it.
-	out = append(out, m.totalRow(cols, st, width))
 	return out
 }
 
-// emptyState explains why the table is blank, and says what would un-blank it
-// when a filter is the cause rather than a genuine absence of data.
-func (m Model) emptyState(width int, st Styles) []string {
-	reason := "nothing recorded in this range"
-	hint := ""
+// emptyReason says why the table is blank, and what would un-blank it when a
+// filter is the cause rather than a genuine absence of data.
+func (m Model) emptyReason() (reason, hint string) {
+	reason = "nothing recorded in this range"
 	switch {
-	case m.search != "":
-		reason = "nothing matches \"" + m.search + "\""
+	case m.trimmedSearch() != "":
+		reason = "nothing matches \"" + m.trimmedSearch() + "\""
 		hint = "esc clears the search"
 	case m.agent != "":
 		reason = "no " + m.agent + " usage in this range"
@@ -202,14 +215,15 @@ func (m Model) emptyState(width int, st Styles) []string {
 	default:
 		hint = "\u2190 \u2192 widens the period"
 	}
+	return reason, hint
+}
 
+// emptyState explains an empty table under a blank line: beside the resting
+// cat when there is room for it, else in two plain lines.
+func (m Model) emptyState(width int, st Styles) []string {
+	reason, hint := m.emptyReason()
 	if !m.cat || !fancyEnabled() || width < 44 {
-		// The reason quotes the search term, which can be any length.
-		out := []string{"", st.Faint.Render(truncate("   "+reason, width))}
-		if hint != "" {
-			out = append(out, st.Faint.Render(truncate("   "+hint, width)))
-		}
-		return out
+		return m.emptyPlain(width, st)
 	}
 	// A resting cat is friendlier than a bare line, and the wait is over
 	// anyway: there is nothing else to put here.
@@ -224,6 +238,30 @@ func (m Model) emptyState(width int, st Styles) []string {
 		out = append(out, truncate(line, width))
 	}
 	return out
+}
+
+// emptyPlain is the empty table's explanation without the cat.
+func (m Model) emptyPlain(width int, st Styles) []string {
+	reason, hint := m.emptyReason()
+	// The reason quotes the search term, which can be any length.
+	out := []string{"", st.Faint.Render(truncate("   "+reason, width))}
+	if hint != "" {
+		out = append(out, st.Faint.Render(truncate("   "+hint, width)))
+	}
+	return out
+}
+
+// emptyFit is the empty table's explanation in at most n lines. It gives up
+// the cat before the words, and the blank line above them before either.
+func (m Model) emptyFit(width int, st Styles, n int) []string {
+	lines := m.emptyState(width, st)
+	if len(lines) > n {
+		lines = m.emptyPlain(width, st)
+	}
+	if len(lines) > n && lines[0] == "" {
+		lines = lines[1:]
+	}
+	return lines[:min(len(lines), max(n, 0))]
 }
 
 // renderRow draws one row. A selected row's highlight is laid under its
@@ -323,7 +361,13 @@ func (m Model) totalRow(cols []col, st Styles, width int) string {
 	for _, c := range cols {
 		switch c.id {
 		case "name":
-			cells = append(cells, padCol("TOTAL", c.width, false))
+			// The row sums the table's range, which it says where the
+			// column has room to.
+			label := "TOTAL"
+			if c.width >= 13 {
+				label = "RANGE TOTAL"
+			}
+			cells = append(cells, padCol(label, c.width, false))
 		case "total":
 			cells = append(cells, padCol(model.FmtTokens(sum.Total()), c.width, true))
 		case "bar":
@@ -380,7 +424,8 @@ func dashZero(n int64) string {
 }
 
 // heatView draws usage by hour of day across the week, revealing when the
-// tokens are actually being spent.
+// tokens are actually being spent: a title and a rule, the hour axis, a line
+// per weekday, a blank line and the peak.
 func (m Model) heatView(width int, st Styles) []string {
 	days := []string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
 	cellW := 2
@@ -441,6 +486,32 @@ func (m Model) heatView(width int, st Styles) []string {
 		out = append(out, st.Faint.Render(truncate("  nothing recorded in this range", width)))
 	}
 	return out
+}
+
+// heatFit fits the heat view into n lines on a short terminal. It gives up,
+// in turn, the blank line, the rule, the title and the peak, and then days
+// from the end of the week, keeping the hour axis that makes the grid
+// readable.
+func heatFit(lines []string, n int) []string {
+	if n >= len(lines) {
+		return lines
+	}
+	if n <= 0 {
+		return nil
+	}
+	title, rule, grid, peak := lines[0], lines[1], lines[2:10], lines[11]
+	var out []string
+	switch {
+	case n >= 11:
+		out = append(append([]string{title, rule}, grid...), peak)
+	case n == 10:
+		out = append(append([]string{title}, grid...), peak)
+	case n == 9:
+		out = append(append([]string{}, grid...), peak)
+	default:
+		out = grid
+	}
+	return out[:min(len(out), n)]
 }
 
 func (m Model) heatPeak() (day, hour int) {
