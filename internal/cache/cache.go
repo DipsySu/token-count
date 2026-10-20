@@ -20,8 +20,10 @@ import (
 // v7 reads a record behind a run of NUL bytes, which a crash can leave glued
 // to its front, and reports a corrupt line instead of skipping it; a file
 // cached by v6 may hold a log read short without a word, so none of it is
-// reused.
-const version = 8
+// reused. v8 keys Codex exchanges by time, model and usage so copies merge
+// across files. v9 drops a Codex subagent's replay of a single parent event,
+// which v8 cached as the child's own.
+const version = 9
 
 func init() {
 	gob.Register(time.Time{})

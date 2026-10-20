@@ -200,6 +200,7 @@ func parseCodex(path string) ([]model.Usage, error) {
 	// token_count events are tracked, so that the burst of parent history it
 	// replays at the head of the log can be told from its own usage.
 	child := false
+	var spawn time.Time
 	var events []int
 	err := forEachJSONL(path, func(line []byte) error {
 		var rec struct {
@@ -234,6 +235,7 @@ func parseCodex(path string) ([]model.Usage, error) {
 		case rec.Type == "session_meta":
 			if thread == "" {
 				child = codexParent(rec.Payload.ForkedFromID, rec.Payload.Source) != ""
+				spawn, _ = model.ParseTime(rec.Timestamp)
 				thread = rec.Payload.ID
 				if thread == "" {
 					thread = rec.Payload.SessionID
@@ -308,7 +310,7 @@ func parseCodex(path string) ([]model.Usage, error) {
 		return nil
 	})
 	if child {
-		out = dropReplayedBurst(out, events)
+		out = dropReplayedBurst(out, events, spawn)
 	}
 	return backfillProject(out, cwd), err
 }
@@ -347,12 +349,21 @@ const replayGap = time.Second
 // back to this burst when it cannot; counting each file on its own, tcount
 // uses the burst alone, which drops the same events whenever Codex rewrote
 // the replay.
-func dropReplayedBurst(out []model.Usage, events []int) []model.Usage {
+//
+// A replay of a single event has no second one to pair with, so the burst
+// also starts when the first event lands within replayGap of spawn, the time
+// of the child's session_meta, where Codex stamps the replay.
+func dropReplayedBurst(out []model.Usage, events []int, spawn time.Time) []model.Usage {
 	within := func(a, b int) bool {
 		d := out[b].Time.Sub(out[a].Time)
 		return d >= 0 && d <= replayGap
 	}
-	if len(events) < 2 || !within(events[0], events[1]) {
+	if len(events) == 0 {
+		return out
+	}
+	d := out[events[0]].Time.Sub(spawn)
+	atSpawn := !spawn.IsZero() && d >= 0 && d <= replayGap
+	if !atSpawn && (len(events) < 2 || !within(events[0], events[1])) {
 		return out
 	}
 	n := 1
