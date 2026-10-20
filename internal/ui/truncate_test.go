@@ -201,7 +201,7 @@ func screens(t *testing.T, w, h int) []screen {
 	add("scanning", func(m *Model) { m.loading, m.spin = true, 4 })
 	add("first scan", func(m *Model) { *m = New(m.opts); m.width, m.height = w, h })
 	add("no records", func(m *Model) { m.setRecords(nil) })
-	add("no records, hours", func(m *Model) { m.records, m.view = nil, aggregate.ViewHeat })
+	add("no records, hours", func(m *Model) { m.setRecords(nil); m.view = aggregate.ViewHeat })
 	add("search miss", func(m *Model) { m.search = "no-such-project-anywhere-in-the-logs-" + strings.Repeat("x", 48) })
 	add("agent without usage", func(m *Model) { m.agent = "gemini" })
 	add("dates too narrow", func(m *Model) {
@@ -220,21 +220,27 @@ func screens(t *testing.T, w, h int) []screen {
 	return out
 }
 
-// checkEveryScreenFits renders every state at every width from 30 columns,
-// the narrowest the layout is drawn for, to 200, and requires the height to
-// be exact, each line to fit and no line to leak its styling into the next.
+// checkEveryScreenFits renders every state at every step-th width from 30
+// columns, the narrowest the layout is drawn for, to 200, and requires the
+// height to be exact, each line to fit and no line to leak its styling into
+// the next.
 // Every state is drawn at a tall height; the states short selects are drawn
 // at the shortest height too, which has no room for the cards and only the
 // unboxed help.
-func checkEveryScreenFits(t *testing.T, short func(what string) bool) {
+func checkEveryScreenFits(t *testing.T, step int, short func(what string) bool) {
 	t.Helper()
-	// Every width, because the layout has breakpoints all through the range;
-	// -short samples it for a quick edit-test loop.
-	step := 1
+	// Every width step apart, because the layout has breakpoints all through
+	// the range; -short samples it for a quick edit-test loop.
 	if testing.Short() {
 		step = 7
 	}
+	var widths []int
 	for w := minWidth; w <= 200; w += step {
+		widths = append(widths, w)
+	}
+	// Where the cards and the mascot appear, whatever the step.
+	widths = append(widths, cardsMinWidth-1, cardsMinWidth, catMinWidth-1, catMinWidth)
+	for _, w := range widths {
 		for _, h := range []int{minHeight, 30} {
 			for _, s := range screens(t, w, h) {
 				if h == minHeight && !short(s.what) {
@@ -262,17 +268,20 @@ func checkEveryScreenFits(t *testing.T, short func(what string) bool) {
 // and the heatmap's summary used to run past a narrow terminal.
 func TestColourViewFitsEveryWidth(t *testing.T) {
 	withFancy(t, true)
-	// At the short height colour changes only the unboxed help, and the
-	// gradients make every render slow, so the rest is drawn short only in
-	// the monochrome sweep.
-	checkEveryScreenFits(t, func(what string) bool { return what == "help" || what == "time" })
+	// Colour paints the text the monochrome sweep lays out at every width;
+	// what it adds that depends on the width is the mascot and its chip,
+	// whose breakpoints are always drawn. The gradients make every render
+	// slow, so it samples every third width. At the short height colour
+	// changes only the unboxed help, so the rest is drawn short only in the
+	// monochrome sweep.
+	checkEveryScreenFits(t, 3, func(what string) bool { return what == "help" || what == "time" })
 }
 
 // Without colour the mascot is gone, and several screens take their plainer
 // branch, which has to fit just the same.
 func TestMonochromeViewFitsEveryWidth(t *testing.T) {
 	withFancy(t, false)
-	checkEveryScreenFits(t, func(string) bool { return true })
+	checkEveryScreenFits(t, 1, func(string) bool { return true })
 }
 
 // cellStyle is the part of a printed cell's style these tests look at.

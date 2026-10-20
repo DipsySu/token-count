@@ -279,7 +279,7 @@ func TestRunReportsIncompleteReads(t *testing.T) {
 
 	for _, args := range [][]string{{"--plain"}, {"today", "hours"}} {
 		out := capture(t, append(args, "--no-cache")...)
-		if !strings.Contains(out, "⚠ 7 files could not be read completely — totals are a lower bound") {
+		if !strings.Contains(out, "⚠ 7 logs could not be read completely — totals are a lower bound") {
 			t.Errorf("%v: no warning:\n%s", args, out)
 		}
 		for i, p := range broken {
@@ -328,5 +328,48 @@ func TestRunHeatmapNamesItsWindow(t *testing.T) {
 		if got := strings.TrimRight(strings.SplitN(out, "\n", 2)[0], " "); got != c.want {
 			t.Errorf("%v: header\n %q, want\n %q", c.args, got, c.want)
 		}
+	}
+}
+
+// A cache that cannot be saved costs the next run some time, not this run its
+// answer: --json and --plain print what they read and warn on stderr. They
+// used to exit 1 with nothing printed.
+func TestRunPrintsDespiteAnUnsavableCache(t *testing.T) {
+	pinTime(t, time.Date(2026, 8, 25, 15, 0, 0, 0, testZone))
+	projects := isolate(t)
+	claudeSession(t, projects, response{"/w/a", time.Date(2026, 8, 25, 10, 0, 0, 0, testZone), 10})
+	// The cache's directory would go under a file, which no one can create.
+	blocker := filepath.Join(t.TempDir(), "file")
+	if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XDG_CACHE_HOME", blocker)
+
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	prev := os.Stderr
+	os.Stderr = w
+	read := make(chan []byte)
+	go func() {
+		b, _ := io.ReadAll(r)
+		read <- b
+	}()
+	var rep map[string]any
+	out := capture(t, "--json")
+	plain := capture(t, "--plain")
+	w.Close()
+	os.Stderr = prev
+	stderr := string(<-read)
+
+	if json.Unmarshal([]byte(out), &rep) != nil || rep["records"] != float64(1) {
+		t.Errorf("--json printed\n%s", out)
+	}
+	if !strings.Contains(plain, "RANGE TOTAL          10") {
+		t.Errorf("--plain printed\n%s", plain)
+	}
+	if strings.Count(stderr, "tcount: warning: could not save the cache:") != 2 {
+		t.Errorf("stderr %q, want a warning for each run", stderr)
 	}
 }

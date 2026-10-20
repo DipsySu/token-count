@@ -391,9 +391,21 @@ func (m Model) loadingBody(w, h int, st Styles) []string {
 
 func (m Model) footer(w int, st Styles) string {
 	if m.input.Focused() {
-		line := st.Footer.Render(" type an agent, model or project") + st.Faint.Render("   ") +
-			st.Key.Render("ctrl+c") + st.Footer.Render(" quit")
-		return joinLR(truncate(line, w), m.footerRight(st), w)
+		// ctrl+c is the way out of the box, so the explanation gives way to
+		// it, and the record count, which the box's own line repeats, gives
+		// way to both.
+		quit := st.Key.Render("ctrl+c") + st.Footer.Render(" quit")
+		full := st.Footer.Render(" type an agent, model or project") + st.Faint.Render("   ") + quit
+		right := m.footerRight(st)
+		for _, left := range []string{full, " " + quit} {
+			if ansi.StringWidth(left)+ansi.StringWidth(right) < w {
+				return joinLR(left, right, w)
+			}
+			if ansi.StringWidth(left) <= w {
+				return left
+			}
+		}
+		return truncate(" "+quit, w)
 	}
 	if m.loading {
 		return st.Footer.Render(truncate(" scanning…", w))
@@ -468,7 +480,8 @@ var helpNotes = []string{
 	"the line under the tabs: dates, UTC offset, filters",
 	"OVERVIEW cards ignore the span and the search; their",
 	"  deltas are like for like: today vs yesterday so far",
-	"⚠ some logs were unreadable: totals are a lower bound",
+	"a ⚠ line means some logs could not be read;",
+	"  totals are then a lower bound",
 	"",
 	"totals = input + cache read + cache write + output",
 	"calls  = upstream API requests, not turns",

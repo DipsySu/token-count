@@ -125,3 +125,23 @@ func TestSpanAndViewChangesStartAtTheTop(t *testing.T) {
 		}
 	}
 }
+
+// A search that matches nothing leaves no row to remember, so the row
+// selected before it is kept aside: deleting the letter that emptied the
+// table brings the selection back to it, not to the top.
+func TestSelectionSurvivesAnEmptySearch(t *testing.T) {
+	m := down(send(newTestModel(t, 120, 40), runes("E")), 6)
+	assertSelected(t, m, "moving down", "2026-08-24/codex")
+	m = send(m, runes("/"), runes("z"))
+	if len(m.flat) != 0 {
+		t.Fatalf("searching for z left %d rows", len(m.flat))
+	}
+	assertSelected(t, send(m, key(tea.KeyBackspace)), "deleting the search", "2026-08-24/codex")
+	assertSelected(t, send(m, key(tea.KeyEsc)), "clearing the search", "2026-08-24/codex")
+	// A new span is a new table, which starts at the top even after an
+	// empty search.
+	m = send(m, key(tea.KeyEnter), runes("3"), runes("/"), key(tea.KeyBackspace))
+	if m.cursor != 0 {
+		t.Errorf("after a new span the selection is at row %d, want the top", m.cursor)
+	}
+}

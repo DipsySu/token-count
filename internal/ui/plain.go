@@ -35,7 +35,7 @@ func ShouldTUI(plain, asJSON bool) bool {
 // different offset, so it is not the offset of every date in the window.
 // Deduped counts the whole load, not just the window.
 //
-// Complete is false when some files could not be read completely, which
+// Complete is false when some logs could not be read completely, which
 // makes every figure a lower bound; Issues then names them.
 type Report struct {
 	Period    string               `json:"period"`
@@ -96,12 +96,13 @@ type ReportRow struct {
 }
 
 // Load parses every session file for the requested agents and returns the
-// deduplicated records alongside what deduplication removed.
-func Load(opts Options) ([]model.Usage, source.Stats, error) {
+// deduplicated records alongside what deduplication removed. The records are
+// whole whatever the error says: it is only the cache failing to save, which
+// costs the next run time, so the caller warns about it and carries on.
+func Load(opts Options) (recs []model.Usage, stats source.Stats, cacheErr error) {
 	c := cache.New("", !opts.NoCache)
-	recs, stats := source.CollectStats(opts.Agents, c, nil)
-	err := c.Save()
-	return recs, stats, err
+	recs, stats = source.CollectStats(opts.Agents, c, nil)
+	return recs, stats, c.Save()
 }
 
 // Export is one non-interactive answer: the window a request covers, the
@@ -289,7 +290,7 @@ func writeIssues(w io.Writer, st Styles, issues []source.Issue) {
 	}
 	const shown = 5
 	fmt.Fprintln(w)
-	fmt.Fprintln(w, st.Warn.Render(" ⚠ "+plural(len(issues), "file")+
+	fmt.Fprintln(w, st.Warn.Render(" ⚠ "+plural(len(issues), "log")+
 		" could not be read completely — totals are a lower bound"))
 	agentW := 0
 	for _, is := range issues[:min(shown, len(issues))] {
@@ -370,7 +371,7 @@ func stripANSI(s string) string { return ansi.Strip(s) }
 
 // WriteHeat prints the hour-of-week grid for the export's window, the same
 // records its rows and counts are drawn from, under the header the table
-// has, and warns after it when some files could not be read completely. It
+// has, and warns after it when some logs could not be read completely. It
 // reads only the records, so an export from ScopeExport is enough.
 func WriteHeat(w io.Writer, opts Options, ex Export, stats source.Stats) {
 	st := newStyles()

@@ -230,6 +230,12 @@ func TestOverviewCaptionNamesTheCardsScope(t *testing.T) {
 		{"agent", func(m *Model) { m.agent = "codex" }, " OVERVIEW · codex · not narrowed by span or search"},
 		{"dates", func(m *Model) { m.opts.Since = &since },
 			" OVERVIEW · all agents · within --since/--until · not narrowed by span or search"},
+		// A load limited with -a covers only those agents; "all agents"
+		// claimed the others too.
+		{"-a subset", func(m *Model) { m.opts.Agents = []string{"claude", "opencode"} },
+			" OVERVIEW · claude,opencode · not narrowed by span or search"},
+		{"-a subset, agent", func(m *Model) { m.opts.Agents, m.agent = []string{"claude", "opencode"}, "claude" },
+			" OVERVIEW · claude · not narrowed by span or search"},
 	} {
 		m := newTestModel(t, 120, 30)
 		c.edit(&m)
@@ -316,5 +322,28 @@ func TestPlainHeaderNamesTheWindowAndFilters(t *testing.T) {
 		if !strings.HasPrefix(cards, " overview  TODAY ") {
 			t.Errorf("the cards line is not labelled as the overview: %q", cards)
 		}
+	}
+}
+
+// A load limited with -a is a filter like any other, so the scope line names
+// the agents it covers. It said nothing, and the figures read as everyone's.
+func TestScopeLineNamesTheAgentSubset(t *testing.T) {
+	m := newTestModel(t, 120, 30)
+	m.opts.Agents = []string{"claude", "opencode"}
+	m.recompute()
+	if got, want := line(m, 2), " 2026-08-12 → 2026-08-25 · 14 days · UTC+08:00 · claude,opencode"; got != want {
+		t.Errorf("scope line\n %q, want\n %q", got, want)
+	}
+	// An agent picked with a names the narrower scope by itself.
+	m = send(m, runes("a"))
+	if got, want := line(m, 2), " 2026-08-12 → 2026-08-25 · 14 days · UTC+08:00 · claude"; got != want {
+		t.Errorf("scope line with an agent picked\n %q, want\n %q", got, want)
+	}
+	// Every agent named is no subset.
+	m = newTestModel(t, 120, 30)
+	m.opts.Agents = append([]string{}, model.Agents...)
+	m.recompute()
+	if got, want := line(m, 2), " 2026-08-12 → 2026-08-25 · 14 days · UTC+08:00"; got != want {
+		t.Errorf("scope line with every agent\n %q, want\n %q", got, want)
 	}
 }

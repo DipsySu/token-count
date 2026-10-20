@@ -135,7 +135,8 @@ func (m Model) notice(w int) (text string, warn bool) {
 		return "", false
 	}
 	if n := len(m.issues); n > 0 {
-		files := plural(n, "file")
+		// A log is a file or a directory that could not be listed.
+		files := plural(n, "log")
 		forms := []string{
 			"⚠ " + files + " could not be read completely — totals are a lower bound (" + m.opts.Name + " --json lists them)",
 			"⚠ " + files + " could not be read completely — totals are a lower bound",

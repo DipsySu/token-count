@@ -131,8 +131,14 @@ type Model struct {
 	input textinput.Model
 	cat   bool
 
-	cursor  int
-	offset  int
+	cursor int
+	offset int
+	// kept is the last row selected before the table went empty, as a
+	// search matching nothing leaves it. An empty table has no selection of
+	// its own to carry, and without this the row came back at the top once
+	// the search matched again.
+	kept selection
+
 	loading bool
 	err     error
 	help    bool
@@ -298,7 +304,10 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		// typed again.
 		m.input.SetValue(m.search)
 		m.input.CursorEnd()
-		return m, m.input.Focus()
+		// Focus changes m.input, so it must run before m is returned: in
+		// one return statement the order of the two is unspecified.
+		cmd := m.input.Focus()
+		return m, cmd
 	case "r":
 		m.loading = true
 		return m, tea.Batch(m.load(), tick())
@@ -461,6 +470,7 @@ func (m *Model) setView(v aggregate.View) {
 // so the selection starts again at the top.
 func (m *Model) reset() {
 	m.cursor, m.offset = 0, 0
+	m.kept = selection{}
 	m.recompute()
 }
 
@@ -468,6 +478,11 @@ func (m *Model) reset() {
 // date, keeping the selection on the row it was on.
 func (m *Model) refresh() {
 	sel := m.selection()
+	if sel.ok {
+		m.kept = sel
+	} else {
+		sel = m.kept
+	}
 	m.recompute()
 	m.reselect(sel)
 }

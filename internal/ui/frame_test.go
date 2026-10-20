@@ -73,16 +73,22 @@ func TestTableKeepsItsRowsBeforeChrome(t *testing.T) {
 }
 
 // Every frame is exactly the terminal's height, and no line is wider than
-// it, at every height where the chrome changes and a few above, in every
-// state that changes which chrome is drawn, with colour on and off. The
-// widths are the breakpoints of the tab bar, the cards and the mascot either
-// side; colour, which is slow to draw, is checked at fewer of them.
+// it, at every height where the chrome changes, in every state that changes
+// which chrome is drawn, with colour on and off. The widths are the
+// breakpoints of the tab bar, the cards and the mascot either side; colour,
+// which is slow to draw, is checked at fewer of them.
+//
+// A frame is drawn only where its layout, apart from the room left for the
+// body, differs from the height below, and at the height below that change:
+// in between, the only thing a taller terminal adds is a body line. The help
+// overlay, which layout does not decide, is drawn at every height. The sweep
+// at the shortest and a tall height in truncate_test.go stands in for this
+// under -short.
 func TestFramesFitAtEveryHeight(t *testing.T) {
-	var heights []int
-	for h := minHeight; h <= 30; h++ {
-		heights = append(heights, h)
+	if testing.Short() {
+		t.Skip("the width sweeps cover the shortest and a tall height")
 	}
-	heights = append(heights, 36, 45)
+	const tallest = 45
 	for _, c := range []struct {
 		fancy  bool
 		widths []int
@@ -92,25 +98,42 @@ func TestFramesFitAtEveryHeight(t *testing.T) {
 	} {
 		withFancy(t, c.fancy)
 		for _, w := range c.widths {
-			for _, h := range heights {
-				if testing.Short() && h%3 != 0 {
-					continue
-				}
-				for _, s := range screens(t, w, h) {
-					lines := strings.Split(s.m.View(), "\n")
-					if len(lines) != h {
-						t.Fatalf("fancy %v %dx%d %s: %d lines", c.fancy, w, h, s.what, len(lines))
+			for _, s := range screens(t, w, tallest) {
+				// shape is the layout with the body's share left out.
+				shape := func(m Model) layout { l := m.layout(); l.body = 0; return l }
+				var prev Model
+				drawn := false
+				for h := minHeight; h <= tallest; h++ {
+					m := resized(s.m, w, h)
+					changed := h == minHeight || h == tallest || s.m.help || shape(m) != shape(prev)
+					if changed && !drawn && h > minHeight {
+						checkFrame(t, c.fancy, s.what, prev)
 					}
-					for i, ln := range lines {
-						if got := lipgloss.Width(ln); got > w {
-							t.Fatalf("fancy %v %dx%d %s: line %d is %d wide: %q", c.fancy, w, h, s.what, i, got, stripANSI(ln))
-						}
-						if leak := styleLeak(ln); leak != "" {
-							t.Fatalf("fancy %v %dx%d %s: line %d: %s", c.fancy, w, h, s.what, i, leak)
-						}
+					if drawn = changed; drawn {
+						checkFrame(t, c.fancy, s.what, m)
 					}
+					prev = m
 				}
 			}
+		}
+	}
+}
+
+// checkFrame fails unless m's frame is exactly its height, no line is wider
+// than its width and no line leaks its styling into the next.
+func checkFrame(t *testing.T, fancy bool, what string, m Model) {
+	t.Helper()
+	w, h := m.width, m.height
+	lines := strings.Split(m.View(), "\n")
+	if len(lines) != h {
+		t.Fatalf("fancy %v %dx%d %s: %d lines", fancy, w, h, what, len(lines))
+	}
+	for i, ln := range lines {
+		if got := lipgloss.Width(ln); got > w {
+			t.Fatalf("fancy %v %dx%d %s: line %d is %d wide: %q", fancy, w, h, what, i, got, stripANSI(ln))
+		}
+		if leak := styleLeak(ln); leak != "" {
+			t.Fatalf("fancy %v %dx%d %s: line %d: %s", fancy, w, h, what, i, leak)
 		}
 	}
 }

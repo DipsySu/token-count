@@ -13,7 +13,7 @@ import (
 	"token-count/internal/ui"
 )
 
-var version = "0.3.0"
+var version = "0.4.0"
 
 // defaultName is what to call ourselves when argv[0] is unusable.
 const defaultName = "tcount"
@@ -83,7 +83,7 @@ func run(name string, args []string) error {
 	untilS := fs.String("until", "", "end date YYYY-MM-DD")
 	asJSON := fs.Bool("json", false, "machine-readable JSON")
 	plain := fs.Bool("plain", false, "print a table instead of the TUI")
-	noCache := fs.Bool("no-cache", false, "ignore ~/.cache/token-count")
+	noCache := fs.Bool("no-cache", false, "neither read nor write ~/.cache/token-count")
 	noCat := fs.Bool("no-cat", false, "hide the mascot and gradients")
 	showVersion := fs.Bool("version", false, "print version")
 	fs.BoolVar(showVersion, "V", false, "print version")
@@ -144,9 +144,11 @@ func run(name string, args []string) error {
 		return ui.RunTUI(opts)
 	}
 
+	// A cache that cannot be saved slows the next run down; this one has
+	// read everything it needs, so it still answers.
 	records, stats, err := ui.Load(opts)
 	if err != nil {
-		return err
+		fmt.Fprintf(os.Stderr, "%s: warning: could not save the cache: %v\n", name, err)
 	}
 	// Every output format is drawn from one export, built against one reading
 	// of the clock, so none of them can disagree about the window it
@@ -297,9 +299,10 @@ OUTPUT
   since/until with utc_offset; records, calls and the rows cover that
   window, and heat.total equals the rows. deduped counts the whole load.
 
-  Files that cannot be read completely make the totals a lower bound: the
-  TUI says so in a warning line, --plain lists up to five after the table,
-  and --json sets "complete": false and lists them all under "issues".
+  Logs (files or directories) that cannot be read completely make the
+  totals a lower bound: the TUI says so in a warning line, --plain lists up
+  to five after the table, and --json sets "complete": false and lists them
+  all under "issues".
 
 ENVIRONMENT
   NO_COLOR             disable all colour

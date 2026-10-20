@@ -10,7 +10,9 @@ import (
 // memo holds what recompute derives that changes only when its inputs do, so
 // that a keystroke redoes only the work it affects. One more letter in the
 // search box used to filter and lowercase the whole archive and recompute
-// every summary card, about 60ms over 100,000 records.
+// every summary card. Over 100,000 records the memo saves little time, about
+// 51ms down to 48ms a keystroke, but most of the garbage: about 41MB
+// allocated a keystroke down to 10MB.
 //
 // Bubble Tea copies the model on every update, and the copies share one
 // memo. Each entry carries the inputs it was computed from and is used only

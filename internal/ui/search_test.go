@@ -227,3 +227,20 @@ func TestSearchMatchesWhatTheTableShows(t *testing.T) {
 		}
 	}
 }
+
+// While the search box is open the footer says how to quit, which is the one
+// thing on it that matters on a narrow terminal: the explanation gives way
+// first. At 40 columns it was cut mid-word and took ctrl+c with it.
+func TestSearchFooterKeepsCtrlC(t *testing.T) {
+	for _, w := range []int{30, 40, 52, 120} {
+		m := send(newTestModel(t, w, 30), runes("/"))
+		lines := strings.Split(stripANSI(m.View()), "\n")
+		foot := lines[len(lines)-1]
+		if !strings.Contains(foot, "ctrl+c quit") || strings.Contains(foot, "…") {
+			t.Errorf("%d columns: footer %q, want ctrl+c quit, uncut", w, foot)
+		}
+		if w >= 52 && !strings.Contains(foot, "type an agent, model or project") {
+			t.Errorf("%d columns: footer %q lost the explanation", w, foot)
+		}
+	}
+}

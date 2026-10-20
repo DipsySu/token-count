@@ -82,7 +82,7 @@ func TestTUIWarnsThatTotalsAreALowerBound(t *testing.T) {
 	writeBroken(t, dir, "msg_c.json")
 	writeBroken(t, dir, "msg_d.json")
 
-	const warning = "⚠ 2 files could not be read completely — totals are a lower bound (tcount --json lists them)"
+	const warning = "⚠ 2 logs could not be read completely — totals are a lower bound (tcount --json lists them)"
 	m := loaded(t, 120, 30)
 	body := stripANSI(m.View())
 	if !strings.Contains(body, warning) {
@@ -140,7 +140,7 @@ func TestPlainWarnsAboutIncompleteReads(t *testing.T) {
 			}
 			continue
 		}
-		head := fmt.Sprintf("⚠ %d file", n)
+		head := fmt.Sprintf("⚠ %d log", n)
 		at := strings.Index(out, head)
 		if at < 0 || at < strings.Index(out, "TOTAL") {
 			t.Fatalf("%d issues: no warning after the table:\n%s", n, out)
@@ -200,5 +200,19 @@ func TestJSONReportsCompleteness(t *testing.T) {
 	if first["agent"] != "opencode" || first["path"] != "/w/logs/msg_0.json" ||
 		first["error"] != "malformed JSON: unexpected end of JSON input" {
 		t.Errorf("first issue %v", first)
+	}
+}
+
+// The help overlay explains the warning line as a legend. It used to state
+// that some logs were unreadable whether or not any were.
+func TestHelpExplainsTheWarningAsALegend(t *testing.T) {
+	m := newTestModel(t, 120, 50)
+	m.help = true
+	body := stripANSI(m.View())
+	if strings.Contains(body, "some logs were unreadable") {
+		t.Errorf("the help claims logs were unreadable:\n%s", body)
+	}
+	if !strings.Contains(body, "a ⚠ line means some logs could not be read;") {
+		t.Errorf("the help does not explain the warning line:\n%s", body)
 	}
 }

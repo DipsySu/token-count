@@ -88,12 +88,17 @@ type chip struct {
 
 // chips are the filters narrowing the table, in the order the scope line
 // shows them. The search term outranks the rest, since it is the filter most
-// likely to empty the table, then the agent, the split by model and the
-// sort.
+// likely to empty the table, then the agent (or the agents the load was
+// limited to), the split by model and the sort.
 func (m Model) chips(st Styles) []chip {
 	var out []chip
 	if m.agent != "" {
 		out = append(out, chip{agentStyle(m.agent).Render(m.agent), 2})
+	} else if sub := agentSubset(m.opts.Agents); sub != "" {
+		// A load limited with -a narrows the table as an agent filter
+		// does, though no key set it. An agent picked with a is narrower
+		// still, and names the scope by itself.
+		out = append(out, chip{st.Muted.Render(sub), 2})
 	}
 	if m.byModel {
 		out = append(out, chip{st.Muted.Render("by model"), 1})
@@ -195,8 +200,12 @@ func (m Model) searchLine(w int, st Styles) string {
 // above them.
 func (m Model) caption(w int, st Styles) string {
 	parts := []string{"OVERVIEW", "all agents"}
-	if m.agent != "" {
+	switch sub := agentSubset(m.opts.Agents); {
+	case m.agent != "":
 		parts[1] = m.agent
+	case sub != "":
+		// The load read only these, so the cards cover nothing else.
+		parts[1] = sub
 	}
 	if m.opts.Since != nil || m.opts.Until != nil {
 		parts = append(parts, "within --since/--until")
