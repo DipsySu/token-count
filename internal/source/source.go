@@ -236,7 +236,7 @@ func agentSpec(agent string) (roots []string, match matcher, parse parser) {
 	case "claude":
 		return sub(claudeRoots(), "projects"), suffix(".jsonl"), parseClaude
 	case "codex":
-		return codexSessionDirs(codexRoots()), suffix(".jsonl"), parseCodex
+		return codexSessionDirs(codexRoots()), codexRollout, parseCodex
 	case "grok":
 		return sub(grokRoots(), "sessions"), named("updates.jsonl"), parseGrok
 	case "gemini":
@@ -262,7 +262,10 @@ func codexSessionDirs(homes []string) []string {
 // codexPreferred keeps one file per rollout of each Codex home. A rollout
 // found at the same path under both sessions/ and archived_sessions/ is read
 // from whichever dir comes first in roots, the live sessions/, as ccusage
-// does. files must be in the order listFiles walked roots.
+// does, whatever its encoding. Within a dir, x.jsonl sorts before
+// x.jsonl.zst, so the plain copy wins, as it does in Codex, which restores it
+// on resume before deleting the .zst. files must be in the order listFiles
+// walked roots.
 func codexPreferred(roots, files []string) []string {
 	seen := map[string]bool{}
 	out := files[:0:0]
@@ -270,7 +273,7 @@ func codexPreferred(roots, files []string) []string {
 		key := f
 		for _, r := range roots {
 			if rel, err := filepath.Rel(r, f); err == nil && !strings.HasPrefix(rel, "..") {
-				key = filepath.Join(filepath.Dir(r), rel)
+				key = filepath.Join(filepath.Dir(r), strings.TrimSuffix(rel, ".zst"))
 				break
 			}
 		}
@@ -298,7 +301,7 @@ func Infos() []model.SourceInfo {
 		agent, note string
 	}{
 		{"claude", "Claude Code session jsonl"},
-		{"codex", "Codex rollout jsonl (sessions + archived_sessions)"},
+		{"codex", "Codex rollout jsonl[.zst] (sessions + archived_sessions)"},
 		{"grok", "Grok turn_completed.usage"},
 		{"gemini", "Gemini CLI chats json/jsonl"},
 		{"opencode", "OpenCode assistant messages"},
@@ -433,6 +436,11 @@ func suffix(ext string) matcher {
 	return func(_ string, d fs.DirEntry) bool {
 		return !d.IsDir() && filepath.Ext(d.Name()) == ext
 	}
+}
+
+// codexRollout matches a Codex rollout, plain or zstd-compressed.
+func codexRollout(path string, d fs.DirEntry) bool {
+	return !d.IsDir() && (strings.HasSuffix(d.Name(), ".jsonl") || strings.HasSuffix(d.Name(), ".jsonl.zst"))
 }
 
 func named(name string) matcher {

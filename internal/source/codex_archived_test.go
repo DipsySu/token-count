@@ -16,7 +16,7 @@ func TestCodexArchivedSessions(t *testing.T) {
 	all, _ := CollectStats([]string{"codex"}, nil, nil)
 	var recs []model.Usage
 	for _, r := range all {
-		if !strings.Contains(r.Source, "2026/08/27") { // codex_replay_test.go's
+		if strings.Contains(r.Source, "2026/08/24") || strings.Contains(r.Source, "2026/08/25") {
 			recs = append(recs, r)
 		}
 	}

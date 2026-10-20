@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+
 	"token-count/internal/model"
 )
 
@@ -185,7 +187,7 @@ func parseCodex(path string) ([]model.Usage, error) {
 		seq++
 		id := thread
 		if id == "" {
-			id = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+			id = strings.TrimSuffix(strings.TrimSuffix(filepath.Base(path), ".zst"), ".jsonl")
 		}
 		return seqKey("codex", id, seq)
 	}
@@ -841,7 +843,17 @@ func forEachJSONL(path string, fn func([]byte) error) error {
 		return err
 	}
 	defer f.Close()
-	lr := lineReader{r: bufio.NewReaderSize(f, 64<<10)}
+	var r io.Reader = f
+	if strings.HasSuffix(path, ".zst") {
+		// Codex compresses old rollouts with zstd.
+		zr, err := zstd.NewReader(f)
+		if err != nil {
+			return err
+		}
+		defer zr.Close()
+		r = zr
+	}
+	lr := lineReader{r: bufio.NewReaderSize(r, 64<<10)}
 	var (
 		skipped *longLinesError
 		corrupt *corruptLinesError
