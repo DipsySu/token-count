@@ -21,7 +21,7 @@ import (
 // to its front, and reports a corrupt line instead of skipping it; a file
 // cached by v6 may hold a log read short without a word, so none of it is
 // reused.
-const version = 7
+const version = 8
 
 func init() {
 	gob.Register(time.Time{})

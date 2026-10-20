@@ -314,7 +314,7 @@ func TestCollectReportsUnreadableFile(t *testing.T) {
 	writeLines(t, filepath.Join(dir, "rollout-2026-08-25T09-00-00-good.jsonl"),
 		codexMeta("good", "good"), codexTurn, tokenCount(1, a, a))
 	bad := writeLines(t, filepath.Join(dir, "rollout-2026-08-25T09-00-00-bad.jsonl"),
-		codexMeta("bad", "bad"), codexTurn, tokenCount(1, a, a))
+		codexMeta("bad", "bad"), codexTurn, tokenCount(2, a, a))
 	if err := os.Chmod(bad, 0); err != nil {
 		t.Fatal(err)
 	}

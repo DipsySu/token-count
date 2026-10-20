@@ -1,0 +1,4 @@
+{"timestamp":"2026-08-27T08:00:00.000Z","type":"session_meta","payload":{"id":"par-1","cwd":"/home/u/proj","source":"cli"}}
+{"timestamp":"2026-08-27T08:00:00.000Z","type":"turn_context","payload":{"model":"gpt-5.6-sol"}}
+{"timestamp":"2026-08-27T08:01:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":200,"reasoning_output_tokens":0,"total_tokens":1200},"total_token_usage":{"input_tokens":1000,"cached_input_tokens":100,"output_tokens":200,"reasoning_output_tokens":0,"total_tokens":1200}}}}
+{"timestamp":"2026-08-27T08:02:00.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":500,"cached_input_tokens":50,"output_tokens":100,"reasoning_output_tokens":0,"total_tokens":600},"total_token_usage":{"input_tokens":1500,"cached_input_tokens":150,"output_tokens":300,"reasoning_output_tokens":0,"total_tokens":1800}}}}
