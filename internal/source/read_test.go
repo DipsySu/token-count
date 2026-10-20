@@ -381,8 +381,10 @@ func TestCollectReportsUnreadableDirectory(t *testing.T) {
 
 	lock(t, home)
 	recs, stats = CollectStats([]string{"codex"}, nil, nil)
-	if len(recs) != 0 || len(stats.Issues) != 1 || stats.Issues[0].Path != sessions {
-		t.Fatalf("with the agent's directory locked: %d records, issues %+v; want %s reported", len(recs), stats.Issues, sessions)
+	// Both of the home's session trees are behind it, live and archived.
+	archived := filepath.Join(home, "archived_sessions")
+	if len(recs) != 0 || len(stats.Issues) != 2 || stats.Issues[0].Path != archived || stats.Issues[1].Path != sessions {
+		t.Fatalf("with the agent's directory locked: %d records, issues %+v; want %s and %s reported", len(recs), stats.Issues, archived, sessions)
 	}
 }
 
