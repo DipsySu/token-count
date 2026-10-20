@@ -474,7 +474,9 @@ func geminiChat(path string, d fs.DirEntry) bool {
 	if ext := filepath.Ext(path); d.IsDir() || (ext != ".json" && ext != ".jsonl") {
 		return false
 	}
-	return filepath.Base(filepath.Dir(path)) == "chats"
+	// Subagents are recorded one level down, in chats/<parent-session-id>/.
+	dir := filepath.Dir(path)
+	return filepath.Base(dir) == "chats" || filepath.Base(filepath.Dir(dir)) == "chats"
 }
 
 // unreadDir is a directory that listFiles could not list.
