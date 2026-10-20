@@ -215,6 +215,9 @@ func collectAgent(agent string, c *cache.Cache) ([]model.Usage, []Issue) {
 	if agent == "codex" {
 		files = codexPreferred(roots, files)
 	}
+	if agent == "gemini" {
+		files = geminiPreferred(files)
+	}
 	recs, issues := mapFiles(agent, files, c, parse)
 	for _, d := range unread {
 		issues = append(issues, Issue{Agent: agent, Path: d.path, Err: describe(d.path, d.err)})
@@ -447,6 +450,24 @@ func named(name string) matcher {
 	return func(_ string, d fs.DirEntry) bool {
 		return !d.IsDir() && d.Name() == name
 	}
+}
+
+// geminiPreferred drops a legacy x.json whose x.jsonl sits beside it. Gemini
+// CLI migrates a resumed .json session by appending its whole history to the
+// .jsonl and leaves the .json in place, so reading both counts it twice.
+func geminiPreferred(files []string) []string {
+	have := make(map[string]bool, len(files))
+	for _, f := range files {
+		have[f] = true
+	}
+	out := files[:0:0]
+	for _, f := range files {
+		if filepath.Ext(f) == ".json" && have[f+"l"] {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
 }
 
 func geminiChat(path string, d fs.DirEntry) bool {
