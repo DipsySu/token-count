@@ -33,7 +33,7 @@ func parseClaude(path string) ([]model.Usage, error) {
 	var out []model.Usage
 	cwd := ""
 	seq := 0
-	err := forEachJSONL(path, func(line []byte) {
+	err := forEachJSONL(path, func(line []byte) error {
 		var rec struct {
 			Type      string `json:"type"`
 			Timestamp string `json:"timestamp"`
@@ -56,18 +56,18 @@ func parseClaude(path string) ([]model.Usage, error) {
 				} `json:"usage"`
 			} `json:"message"`
 		}
-		if json.Unmarshal(line, &rec) != nil {
-			return
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return err
 		}
 		if rec.Cwd != "" && cwd == "" {
 			cwd = rec.Cwd
 		}
 		if rec.Type != "assistant" || rec.Message.Usage == nil {
-			return
+			return nil
 		}
 		ts, ok := model.ParseTime(rec.Timestamp)
 		if !ok {
-			return
+			return nil
 		}
 		u := rec.Message.Usage
 		seq++
@@ -95,6 +95,7 @@ func parseClaude(path string) ([]model.Usage, error) {
 		}); ok {
 			out = append(out, usage)
 		}
+		return nil
 	})
 	return backfillProject(out, cwd), err
 }
@@ -193,7 +194,7 @@ func parseCodex(path string) ([]model.Usage, error) {
 	// recorded is set at the log's first token_usage_record, from where on
 	// token_count events are not counted.
 	recorded := false
-	err := forEachJSONL(path, func(line []byte) {
+	err := forEachJSONL(path, func(line []byte) error {
 		var rec struct {
 			Timestamp string `json:"timestamp"`
 			Type      string `json:"type"`
@@ -214,8 +215,8 @@ func parseCodex(path string) ([]model.Usage, error) {
 				} `json:"info"`
 			} `json:"payload"`
 		}
-		if json.Unmarshal(line, &rec) != nil {
-			return
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return err
 		}
 		if rec.Payload.Cwd != "" && cwd == "" {
 			cwd = rec.Payload.Cwd
@@ -231,15 +232,15 @@ func parseCodex(path string) ([]model.Usage, error) {
 			if rec.Payload.Model != "" {
 				modelName = rec.Payload.Model
 			}
-			return
+			return nil
 		case rec.Type == "turn_context" && rec.Payload.Model != "":
 			modelName = rec.Payload.Model
-			return
+			return nil
 		case rec.Type == "event_msg" && rec.Payload.Type == "thread_settings_applied":
 			if rec.Payload.ThreadSettings != nil && rec.Payload.ThreadSettings.Model != "" {
 				modelName = rec.Payload.ThreadSettings.Model
 			}
-			return
+			return nil
 		case rec.Type == "token_usage_record":
 			// Whatever this one holds, the log records its responses from
 			// here on, and every token_count event after it repeats one.
@@ -248,11 +249,11 @@ func parseCodex(path string) ([]model.Usage, error) {
 			// untimed event is, and one of no usage is no call.
 			ts, ok := model.ParseTime(rec.Timestamp)
 			if !ok || rec.Payload.Usage == nil {
-				return
+				return nil
 			}
 			usage, ok := codexCall(path, ts, modelName, *rec.Payload.Usage)
 			if !ok {
-				return
+				return nil
 			}
 			// Every call takes a position, which keys it only if it lacks
 			// a response id.
@@ -261,13 +262,13 @@ func parseCodex(path string) ([]model.Usage, error) {
 				usage.Dedup = "codex|resp|" + rec.Payload.ResponseID
 			}
 			out = append(out, usage)
-			return
+			return nil
 		case recorded || rec.Type != "event_msg" || rec.Payload.Type != "token_count":
-			return
+			return nil
 		}
 		info := rec.Payload.Info
 		if info == nil {
-			return
+			return nil
 		}
 		// An event without a usable time is dropped whole, like a malformed
 		// line. Were its total kept as the baseline, a re-publication of the
@@ -275,20 +276,21 @@ func parseCodex(path string) ([]model.Usage, error) {
 		// the exchange would not be counted at all.
 		ts, ok := model.ParseTime(rec.Timestamp)
 		if !ok {
-			return
+			return nil
 		}
 		use, counted := codexExchange(info.LastTokenUsage, info.TotalTokenUsage, prev)
 		if info.TotalTokenUsage != nil {
 			prev = info.TotalTokenUsage
 		}
 		if !counted {
-			return
+			return nil
 		}
 		key := position()
 		if usage, ok := codexCall(path, ts, modelName, use); ok {
 			usage.Dedup = key
 			out = append(out, usage)
 		}
+		return nil
 	})
 	return backfillProject(out, cwd), err
 }
@@ -390,7 +392,7 @@ func parseGrok(path string) ([]model.Usage, error) {
 	session := filepath.Base(filepath.Dir(path))
 	turn := 0
 	var out []model.Usage
-	err := forEachJSONL(path, func(line []byte) {
+	err := forEachJSONL(path, func(line []byte) error {
 		var rec struct {
 			Timestamp json.RawMessage `json:"timestamp"`
 			Params    struct {
@@ -400,15 +402,15 @@ func parseGrok(path string) ([]model.Usage, error) {
 				} `json:"update"`
 			} `json:"params"`
 		}
-		if json.Unmarshal(line, &rec) != nil {
-			return
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return err
 		}
 		if rec.Params.Update == nil || rec.Params.Update.SessionUpdate != "turn_completed" || rec.Params.Update.Usage == nil {
-			return
+			return nil
 		}
 		ts, ok := model.ParseRawTime(rec.Timestamp)
 		if !ok {
-			return
+			return nil
 		}
 		u := rec.Params.Update.Usage
 		turn++
@@ -428,6 +430,7 @@ func parseGrok(path string) ([]model.Usage, error) {
 				out = append(out, usage)
 			}
 		}
+		return nil
 	})
 	return out, err
 }
@@ -668,21 +671,46 @@ func readJSON(path string, v any) (bool, error) {
 var maxLineBytes = 64 << 20
 
 // forEachJSONL calls fn with every non-blank line of a JSONL file, trimmed of
-// surrounding space. The slice is only valid until fn returns.
+// surrounding space. The slice is only valid until fn returns. fn returns the
+// error decoding the line gave, if any.
 //
 // A line longer than maxLineBytes is skipped and reading carries on with the
 // next; the skipped lines are reported in the error returned at the end,
 // because whatever usage they held is missing from the totals. bufio.Scanner,
 // used before, stopped for good at the first such line, so the records after
 // it were lost without a word. A read error ends the walk and is returned.
-func forEachJSONL(path string, fn func([]byte)) error {
+//
+// A line that is not JSON is reported the same way, unless it is the last:
+// an agent still writing its log leaves the last line half done, and it will
+// be whole on the next pass. A crash can leave a run of NUL bytes where data
+// was due, alone on a line or glued in front of the next record, so leading
+// NULs are dropped first: a record after them is intact and counts, and a
+// line of nothing else is a corrupt one. JSON of a shape fn did not expect
+// is not ours to count, and is not corrupt.
+func forEachJSONL(path string, fn func([]byte) error) error {
 	f, err := os.Open(path)
 	if err != nil {
 		return err
 	}
 	defer f.Close()
 	lr := lineReader{r: bufio.NewReaderSize(f, 64<<10)}
-	var skipped *longLinesError
+	var (
+		skipped *longLinesError
+		corrupt *corruptLinesError
+		// pending is the number of the latest line that did not parse, until
+		// a line after it shows that it was not the last.
+		pending int
+	)
+	confirm := func() {
+		if pending == 0 {
+			return
+		}
+		if corrupt == nil {
+			corrupt = &corruptLinesError{first: pending}
+		}
+		corrupt.count++
+		pending = 0
+	}
 	for {
 		line, tooLong, err := lr.next()
 		if err == io.EOF {
@@ -692,20 +720,38 @@ func forEachJSONL(path string, fn func([]byte)) error {
 			return err
 		}
 		if tooLong {
+			confirm()
 			if skipped == nil {
 				skipped = &longLinesError{first: lr.n, limit: maxLineBytes}
 			}
 			skipped.count++
 			continue
 		}
-		if line = bytes.TrimSpace(line); len(line) > 0 {
-			fn(line)
+		if line = bytes.TrimSpace(line); len(line) == 0 {
+			continue
+		}
+		confirm()
+		line = bytes.TrimSpace(bytes.TrimLeft(line, "\x00"))
+		if len(line) == 0 || malformed(fn(line)) {
+			pending = lr.n
 		}
 	}
-	if skipped != nil {
+	switch {
+	case skipped != nil && corrupt != nil:
+		return fmt.Errorf("%w; %w", skipped, corrupt)
+	case skipped != nil:
 		return skipped
+	case corrupt != nil:
+		return corrupt
 	}
 	return nil
+}
+
+// malformed reports whether err says a line is not JSON at all, rather than
+// JSON of another shape.
+func malformed(err error) bool {
+	var shape *json.UnmarshalTypeError
+	return err != nil && !errors.As(err, &shape)
 }
 
 // lineReader splits a stream into lines without ever holding more than
@@ -787,4 +833,18 @@ func (e *longLinesError) Error() string {
 		return fmt.Sprintf("line %d is longer than %s and was not counted", e.first, limit)
 	}
 	return fmt.Sprintf("%d lines longer than %s were not counted, the first at line %d", e.count, limit, e.first)
+}
+
+// corruptLinesError reports the lines forEachJSONL could not parse, other
+// than the last.
+type corruptLinesError struct {
+	count int // how many there were
+	first int // the number of the first, from 1
+}
+
+func (e *corruptLinesError) Error() string {
+	if e.count == 1 {
+		return fmt.Sprintf("line %d is corrupt and was not counted", e.first)
+	}
+	return fmt.Sprintf("%d corrupt lines were not counted, the first at line %d", e.count, e.first)
 }

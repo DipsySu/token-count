@@ -15,7 +15,7 @@ import (
 func lineParser(path string) ([]model.Usage, error) {
 	var out []model.Usage
 	n := 0
-	err := forEachJSONL(path, func([]byte) {
+	err := forEachJSONL(path, func([]byte) error {
 		n++
 		u, _ := model.Make(model.MakeOpts{
 			Agent: "codex",
@@ -24,6 +24,7 @@ func lineParser(path string) ([]model.Usage, error) {
 			Dedup: seqKey("codex", "test", n),
 		})
 		out = append(out, u)
+		return nil
 	})
 	return out, err
 }

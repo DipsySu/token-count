@@ -431,30 +431,48 @@ func listFiles(roots []string, match matcher) ([]string, []unreadDir) {
 		seen[key] = struct{}{}
 		return true
 	}
-	failed := func(path string, err error) {
+	// failed records a directory that could not be listed, found at path
+	// and reported as name.
+	failed := func(path, name string, err error) {
 		if !errors.Is(err, fs.ErrNotExist) && first(path) {
-			unread = append(unread, unreadDir{path, err})
+			unread = append(unread, unreadDir{name, err})
 		}
 	}
 	for _, root := range roots {
 		st, err := os.Stat(root)
 		if err != nil {
-			failed(root, err)
+			failed(root, root, err)
 			continue
 		}
 		if !st.IsDir() {
 			continue
 		}
-		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		// os.Stat follows a symlinked root, but WalkDir does not descend
+		// one: it reports the link and stops, and the root yielded nothing.
+		// The walk goes through the target, and what it finds is named under
+		// the root as given, the path the user knows it by. Files are told
+		// apart by where they really are, so a root reached both through a
+		// link and directly is read once.
+		walked := root
+		if resolved, err := filepath.EvalSymlinks(root); err == nil {
+			walked = resolved
+		}
+		named := func(path string) string {
+			if rel, err := filepath.Rel(walked, path); err == nil {
+				return filepath.Join(root, rel)
+			}
+			return path
+		}
+		_ = filepath.WalkDir(walked, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
-				failed(path, err)
+				failed(path, named(path), err)
 				return nil
 			}
-			if d.IsDir() || match == nil || !match(path, d) {
+			if d.IsDir() || match == nil || !match(named(path), d) {
 				return nil
 			}
 			if first(path) {
-				out = append(out, path)
+				out = append(out, named(path))
 			}
 			return nil
 		})

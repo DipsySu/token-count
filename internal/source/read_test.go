@@ -27,7 +27,7 @@ func lowerLineLimit(t *testing.T, n int) {
 func readAll(t *testing.T, path string) ([]string, error) {
 	t.Helper()
 	var got []string
-	err := forEachJSONL(path, func(line []byte) { got = append(got, string(line)) })
+	err := forEachJSONL(path, func(line []byte) error { got = append(got, string(line)); return nil })
 	return got, err
 }
 
@@ -133,11 +133,11 @@ func TestForEachJSONLReturnsReadErrors(t *testing.T) {
 	dir := t.TempDir()
 	called := false
 	// Opening a directory succeeds; reading it fails.
-	err := forEachJSONL(dir, func([]byte) { called = true })
+	err := forEachJSONL(dir, func([]byte) error { called = true; return nil })
 	if err == nil || called {
 		t.Fatalf("reading a directory gave %v (called %v), want a read error", err, called)
 	}
-	err = forEachJSONL(filepath.Join(dir, "missing.jsonl"), func([]byte) { called = true })
+	err = forEachJSONL(filepath.Join(dir, "missing.jsonl"), func([]byte) error { called = true; return nil })
 	if !errors.Is(err, fs.ErrNotExist) || called {
 		t.Fatalf("missing file gave %v", err)
 	}
@@ -150,7 +150,7 @@ func TestForEachJSONLReturnsReadErrors(t *testing.T) {
 // of ours to count and is not reported.
 func TestWholeFileParsersReportBrokenFiles(t *testing.T) {
 	gemini := `{"cwd":"/home/u/proj","messages":[{"timestamp":"2026-08-25T01:00:00.000Z","model":"gemini-3-pro","tokens":{"input":100,"output":10,"cached":40,"thoughts":5}}]}`
-	opencode := `{"id":"msg_1","role":"assistant","modelID":"m-1","path":{"cwd":"/home/u/proj"},"tokens":{"input":100,"output":10,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1787627800000,"completed":1787627805000}}`
+	opencode := `{"id":"msg_1","role":"assistant","modelID":"m-1","path":{"cwd":"/home/u/proj"},"tokens":{"input":100,"output":10,"reasoning":0,"cache":{"read":0,"write":0}},"time":{"created":1787619660000,"completed":1787619665000}}`
 	cases := []struct {
 		name    string
 		parse   parser
@@ -410,10 +410,11 @@ func TestForEachJSONLAssemblesLongLinesCheaply(t *testing.T) {
 	var n int
 	var err error
 	if got := bytesAllocated(func() {
-		err = forEachJSONL(path, func(l []byte) {
+		err = forEachJSONL(path, func(l []byte) error {
 			if string(l) == line {
 				n++
 			}
+			return nil
 		})
 	}); err != nil || n != 1 || got > 3*uint64(len(line)) {
 		t.Fatalf("read the line %d times (%v), allocating %d bytes; want once, under three times its %d", n, err, got, len(line))
@@ -425,7 +426,7 @@ func TestForEachJSONLAssemblesLongLinesCheaply(t *testing.T) {
 	if err := os.WriteFile(path, []byte(strings.Repeat("x", 3*limit)+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got := bytesAllocated(func() { err = forEachJSONL(path, func([]byte) {}) }); err == nil || got > 3*uint64(limit) {
+	if got := bytesAllocated(func() { err = forEachJSONL(path, func([]byte) error { return nil }) }); err == nil || got > 3*uint64(limit) {
 		t.Fatalf("dropping a line three times the limit allocated %d bytes (%v); want under three times the limit", got, err)
 	}
 

@@ -148,3 +148,32 @@ func TestInfosListsEveryRoot(t *testing.T) {
 		t.Fatalf("claude reported %d roots, want 2", n)
 	}
 }
+
+// A root that is itself a symlink, as a dotfiles manager or a moved home
+// directory leaves one, is walked through to its target. WalkDir does not
+// follow a symlinked root, so it used to yield no files at all and no issue.
+// The files are named under the root as given, and a root reached both
+// through the link and directly is read once.
+func TestListFilesFollowsSymlinkedRoot(t *testing.T) {
+	dir := t.TempDir()
+	real := filepath.Join(dir, "real")
+	if err := os.MkdirAll(filepath.Join(real, "p"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "p", "s.jsonl"), []byte("{}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Skip("no symlinks here:", err)
+	}
+
+	files, unread := listFiles([]string{link}, suffix(".jsonl"))
+	if want := filepath.Join(link, "p", "s.jsonl"); len(files) != 1 || files[0] != want || len(unread) != 0 {
+		t.Errorf("found %v (unreadable %+v), want %s", files, unread, want)
+	}
+	files, _ = listFiles([]string{link, real}, suffix(".jsonl"))
+	if len(files) != 1 {
+		t.Errorf("found %v through the link and directly, want the file once", files)
+	}
+}

@@ -17,7 +17,11 @@ import (
 // one per response, keyed by response id and timed by the record, in place of
 // the token_count events that repeat them, and marks the key of a call Claude
 // Code copied into another session's log. Entries cached earlier lack both.
-const version = 6
+// v7 reads a record behind a run of NUL bytes, which a crash can leave glued
+// to its front, and reports a corrupt line instead of skipping it; a file
+// cached by v6 may hold a log read short without a word, so none of it is
+// reused.
+const version = 7
 
 func init() {
 	gob.Register(time.Time{})
