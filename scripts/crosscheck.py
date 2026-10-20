@@ -42,13 +42,25 @@ def tcount(agent, env, repo):
                          cwd=repo, env=env, capture_output=True, text=True, check=True).stdout
     return json.loads(out)["snapshot"]["all"]
 
+# Pinned so the gate cannot change under us; bump deliberately.
+CCUSAGE = "ccusage@20.0.37"
+
 def ccusage(agent, env):
-    p = subprocess.run(["npx", "-y", "ccusage@latest", agent, "daily", "--json", "--offline"],
+    """ccusage totals for one agent. Any failure is fatal: a gate that reads a
+    broken run as zeros would pass falsely. ccusage reports an agent with no
+    logs as valid JSON with zero totals and exit 0, so that stays allowed."""
+    p = subprocess.run(["npx", "-y", CCUSAGE, agent, "daily", "--json", "--offline"],
                        env=env, capture_output=True, text=True)
+    if p.returncode != 0 or not p.stdout.strip():
+        sys.exit(f"FAIL: {CCUSAGE} {agent} exited {p.returncode} with "
+                 f"{'empty' if not p.stdout.strip() else 'unusable'} output:\n{p.stderr.strip()[-2000:]}")
     try:
-        return json.loads(p.stdout).get("totals") or {}
-    except json.JSONDecodeError:
-        return {}  # no data for this agent
+        totals = json.loads(p.stdout).get("totals")
+    except json.JSONDecodeError as e:
+        sys.exit(f"FAIL: {CCUSAGE} {agent} printed invalid JSON: {e}")
+    if not isinstance(totals, dict):
+        sys.exit(f"FAIL: {CCUSAGE} {agent} output has no totals")
+    return totals
 
 def main():
     ap = argparse.ArgumentParser()
@@ -60,6 +72,10 @@ def main():
     bad = 0
     print(f"{'agent':7} {'field':12} {'tcount':>14} {'ccusage':>14} {'diff':>12}  status")
     for agent in a.agents.split(","):
+        if a.home and not os.path.isdir(os.path.join(a.home, "." + agent)):
+            # ccusage refuses a missing data dir; say so instead of comparing zeros
+            print(f"{agent:7} {'-':12} skipped: fixture has no .{agent}/")
+            continue
         t, c = tcount(agent, env, repo), ccusage(agent, env)
         for tf, cf in FIELDS:
             names = cf if isinstance(cf, tuple) else (cf,)

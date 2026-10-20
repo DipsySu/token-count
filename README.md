@@ -20,7 +20,7 @@ agent 会把同一次调用写好几遍，tcount 全局去重，每次上游调�
 已知取舍（与 ccusage 一致）：
 
 - Codex 的交换按「时间戳 + 模型 + 各项 token」去重，所以两个真不同的会话若在同一毫秒、同一模型、各项 token 完全相同，会被合并成一条。测试 `TestCodexIdenticalExchangesInDifferentSessionsMerge` 钉住了这一行为。
-- Codex 子 agent 的日志开头会重放父会话历史。tcount 把开头相邻间隔不超过 1 秒的那一串 `token_count` 当作重放丢掉；如果子 agent 自己的前两次调用真在 1 秒内，会被少算。目前只用夹具验证过，等有真实子 agent 日志再复核。
+- Codex 子 agent 的日志开头会重放父会话历史。tcount 把时间戳落在子 agent 启动后 1 秒内的 `token_count`，以及紧接其后、相邻间隔不超过 1 秒的那一串，都当作重放丢掉；如果子 agent 自己的调用真在启动后 1 秒内、或前两次调用间隔不到 1 秒，会被少算。目前只用夹具验证过，等有真实子 agent 日志再复核。
 
 `--json` 输出里的 `deduped` 说明丢掉了多少，统计的是整次加载，不限于当前窗口。
 
