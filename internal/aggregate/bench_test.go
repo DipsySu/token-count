@@ -50,7 +50,7 @@ func benchRecords(now time.Time, n int) []model.Usage {
 		agent := model.Agents[rng.IntN(len(model.Agents))]
 		models := benchModels[agent]
 		mdl := models[rng.IntN(len(models))]
-		project := filepath.Join(home, "Developer", "project-"+strconv.Itoa(rng.IntN(30)))
+		project := filepath.Join(home, "src", "project-"+strconv.Itoa(rng.IntN(30)))
 		y, m, d := now.AddDate(0, 0, -rng.IntN(400)).Date()
 		t := time.Date(y, m, d, 7+rng.IntN(16), rng.IntN(60), rng.IntN(60), rng.IntN(1e9), time.Local)
 		for range 20 + rng.IntN(180) {

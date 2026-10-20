@@ -13,7 +13,7 @@ calls  = 上游 API 请求数（不是对话轮数）
 
 agent 会把同一次调用写好几遍，tcount 全局去重，每次上游调用只计一次。结果是确定的：同一批日志，每次运行、无论扫描顺序，算出的数都一样。
 
-- **Claude Code** 在 `--resume` 或会话分叉时会把历史消息**复制**进新的 jsonl；流式响应还会先写几份只带部分 output 的快照。tcount 按 `message.id` + `requestId` 去重，保留最大（即完整）的那一份。本机实测：7,352 条 assistant 记录里只有 2,436 条是真的，不去重会让 Claude 的用量虚高约 **3 倍**。子 agent（sidechain）有独立 `message.id`，正常计入。
+- **Claude Code** 在 `--resume` 或会话分叉时会把历史消息**复制**进新的 jsonl；流式响应还会先写几份只带部分 output 的快照。tcount 按 `message.id` + `requestId` 去重，保留最大（即完整）的那一份。重复的往往比真的还多，不去重 Claude 的用量可能虚高数倍。子 agent（sidechain）有独立 `message.id`，正常计入。
 - **Codex** 的 `token_count` 事件会在限流刷新、上下文压缩、进程恢复时原样再发一遍，累计值没变的那条跳过，每次交换的花费取 `last_token_usage`。新版 Codex 的日志带 `token_usage_record` 行：每行就是一次上游调用，按 `response_id` 去重；同一文件里第一条 record 之后的 `token_count` 不再计入，只有它之前的部分（老版本写的）按事件算。子 agent 的线程单独计入；拷到别处的日志（换机器、多个目录）只算一次。
 - **Grok** 的 `turn_completed` 按会话 + 轮次（+ 模型）去重，**Gemini** 按会话文件和消息序号，**OpenCode** 按消息 id。
 
@@ -22,7 +22,7 @@ agent 会把同一次调用写好几遍，tcount 全局去重，每次上游调�
 ## 安装
 
 ```bash
-cd ~/tool-lib/token_count
+git clone https://github.com/DipsySu/token-count.git && cd token-count
 make install
 ```
 
@@ -85,12 +85,12 @@ tcount month --by-model --since 2026-01-01
 | `utc_offset` | 生成报告时的本地 UTC 偏移 |
 | `rows` / `records` / `calls` | 都只覆盖这个窗口 |
 | `heat` | 只有 hours 视图才有；`heat.total` 等于各行之和 |
-| `snapshot` | 今天 / 本周 / 本月 / 今年的卡片，不受跨度限制，但受 `--since/--until` 限制 |
+| `snapshot` | 今天 / 本周 / 本月 / 今年的卡片，外加 `all`（整次加载的合计）；不受跨度限制，但受 `--since/--until` 限制 |
 | `deduped` | 去重丢掉的记录和 token，统计整次加载 |
-| `complete` | 总有；为 `false` 时有文件没能读全，所有数字都是下限 |
+| `complete` | 总有；为 `false` 时有日志没能读全，所有数字都是下限 |
 | `issues` | 没读全的文件或目录（`agent` / `path` / `error`）；全部读全时省略 |
 
-有文件读不全（权限、损坏、超长行、目录列不出来）时，三种输出都会说：TUI 有一行 ⚠ 警告，`--plain` 和热力图在表后列出前 5 个（`agent  path: error`）并写明还有几个，`--json` 如上。
+有日志（文件或目录）读不全（权限、损坏、超长行、崩溃留下的坏行、目录列不出来）时，三种输出都会说：TUI 有一行 ⚠ 警告，`--plain` 和热力图在表后列出前 5 个（`agent  path: error`）并写明还有几个，`--json` 如上。
 
 TUI 快捷键：
 
@@ -115,17 +115,17 @@ TUI 快捷键：
 | `q` | 退出 |
 | `ctrl+c` | 退出，任何状态下都有效（搜索框、帮助、详情、扫描中） |
 
-**搜索**：不分大小写，同时匹配原始值和表里显示的形式，所以 `~/work` 能搜到家目录下的项目，短模型名也行。中文输入法和粘贴的文本都能用（换行、Tab 变成空格），退格删整个字符。搜索框打开时字母都是文字，不会触发快捷键；`enter` 保留搜索回到表格，`esc` 清空。
+**搜索**：不分大小写，同时匹配原始值和表里显示的形式，所以 `~/work` 能搜到家目录下的项目，短模型名也行。中文输入法和粘贴的文本都能用（换行、Tab 变成空格），退格删一个字符。搜索框打开时字母都是文字，不会触发快捷键；`enter` 保留搜索回到表格，`esc` 清空。
 
 **选中行跟着走**：排序、换 agent、按模型拆、搜索、重扫、全部展开/收起之后，光标仍停在原来那一行（行没了就停在它的上级）；换跨度或视图才回到顶部。
 
 ## 界面
 
-- **范围行**（tab 栏下面那行）写明表格覆盖什么：首末日期和天数，如 `2026-10-06 → 2026-10-19 · 14 days`、`2026-10-19 · today`；起点无界时用范围内最早一条记录，如 `since 2026-04-30 → 2026-10-19`，没有记录则是 `all history`。后面是 UTC 偏移和生效的过滤：agent（带颜色）、by model、排序、搜索词。放不下时先丢天数，再丢偏移、年份，然后是整段日期，过滤条件留到最后（搜索词最优先，太长就截断）。搜索时这一行就是输入框，旁边写着匹配了多少条。
-- **OVERVIEW 卡片**上方有一行说明：卡片只受 agent 过滤（和 `--since/--until`）影响，不受跨度和搜索影响，免得被当成搜索结果。卡片的涨跌是同口径比较：今天 vs 昨天同一时刻为止、本周 vs 上周同一星期几同一时刻、本月 vs 上月同一天同一时刻。
+- **范围行**（tab 栏下面那行）写明表格覆盖什么：首末日期和天数，如 `2026-10-06 → 2026-10-19 · 14 days`、`2026-10-19 · today`；起点无界时用范围内最早一条记录，如 `since 2026-04-30 → 2026-10-19`，没有记录则是 `all history → 2026-10-19`。后面是 UTC 偏移和生效的过滤：agent（带颜色；用 `-a` 只加载了部分 agent 时列出它们）、by model、排序、搜索词。放不下时先丢天数，再丢偏移、年份，然后是整段日期，过滤条件留到最后（搜索词最优先，太长就截断）。搜索时这一行就是输入框，旁边写着匹配了多少条。
+- **OVERVIEW 卡片**上方有一行说明：卡片只受 agent 过滤（`a` 键、`-a`）和 `--since/--until` 影响，不受跨度和搜索影响，免得被当成搜索结果。卡片的涨跌是同口径比较：今天 vs 昨天同一时刻为止、本周 vs 上周同一星期几同一时刻、本月 vs 上月同一天同一时刻。
 - 表格最后一行是 **RANGE TOTAL**（名称列太窄时写 TOTAL），即当前范围的合计。
-- 有文件没读全时，卡片下面有一行 ⚠ 警告，说总数是下限；它比去重提示优先。
-- 终端矮的时候按固定顺序让位，保证表格至少有 5 行（不足 5 行就全部）：先是小猫和卡片，再是空行和分隔线，然后去重提示、详情面板，⚠ 警告最后。标题、tab 栏、范围行、表头、合计行、底栏始终都在。tab 栏太窄时先去掉未选中 tab 的留白，再只显示当前的跨度和视图（`‹ day › ←→   ‹ project › tab`），不会把标签截成半个。
+- 有日志（文件或目录）没读全时，卡片下面有一行 ⚠ 警告，说总数是下限；它比去重提示优先。
+- 终端矮的时候按固定顺序让位，让表格尽量有 5 行（不足 5 行就全部；最矮的 10 行终端里固定的行占去 6 行，表格只剩 4 行）：先是小猫和卡片，再是空行和分隔线，然后去重提示、详情面板，⚠ 警告最后。标题、tab 栏、范围行、表头、合计行、底栏始终都在。tab 栏太窄时先去掉未选中 tab 的留白，再只显示当前的跨度和视图（`‹ day › ←→   ‹ project › tab`），不会把标签截成半个。
 - 终端至少要 30×10，再小会提示 `terminal too small`。
 - TUI 开着过了午夜会自动切到新的一天。
 
@@ -177,13 +177,13 @@ TUI 快捷键：
 
 | Agent | 路径 | 覆盖环境变量 |
 | --- | --- | --- |
-| Claude Code | `~/.claude/projects/**/*.jsonl` | `CLAUDE_CONFIG_DIR` |
+| Claude Code | `~/.claude/projects/**/*.jsonl` 和 `$XDG_CONFIG_HOME/claude/projects/**/*.jsonl`（默认 `~/.config/claude`） | `CLAUDE_CONFIG_DIR` |
 | Codex | `~/.codex/sessions/**/*.jsonl` | `CODEX_HOME` |
 | Grok | `~/.grok/sessions/**/updates.jsonl` | `GROK_HOME` |
-| Gemini CLI | `~/.gemini/tmp/**/chats/*.json` | `GEMINI_DIR` |
+| Gemini CLI | `~/.gemini/**/chats/*.json` | `GEMINI_DIR` |
 | OpenCode | `~/.local/share/opencode/storage/message/**/*.json` | `OPENCODE_DATA` / `XDG_DATA_HOME` |
 
-解析结果缓存在 `~/.cache/token-count/index-v6.gob`（`XDG_CACHE_HOME` 可改位置），按文件 mtime + 大小失效；没读全的文件不进缓存，下次重读。TUI 里按 `r` 重新扫描（没变的文件仍走缓存）；`--no-cache` 既不读也不写缓存。缓存格式升级后，旧版本留下的 `index-v*.gob` 不会自动清理，可以手动删掉。
+解析结果缓存在 `~/.cache/token-count/index-v7.gob`（`XDG_CACHE_HOME` 可改位置），按文件 mtime + 大小失效；没读全的文件不进缓存，下次重读。日志中间有解析不了的行（比如崩溃留下的一串 NUL）算作没读全；正在写的日志最后一行写到一半不算。TUI 里按 `r` 重新扫描（没变的文件仍走缓存）；`--no-cache` 既不读也不写缓存。缓存格式升级后，旧版本留下的 `index-v*.gob` 不会自动清理，可以手动删掉。
 
 ## 开发
 

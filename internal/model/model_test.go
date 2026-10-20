@@ -17,11 +17,11 @@ func TestParseTimeISO(t *testing.T) {
 }
 
 func TestParseUnix(t *testing.T) {
-	ts, ok := ParseTime(int64(1787550336))
+	ts, ok := ParseTime(int64(1787659200))
 	if !ok || ts.UTC().Year() != 2026 {
 		t.Fatalf("unix %v %v", ok, ts)
 	}
-	ts, ok = ParseTime(int64(1787550336000))
+	ts, ok = ParseTime(int64(1787659200000))
 	if !ok || ts.UTC().Year() != 2026 {
 		t.Fatalf("unix ms %v %v", ok, ts)
 	}
@@ -31,15 +31,15 @@ func TestMakeInputIncludesCache(t *testing.T) {
 	u, ok := Make(MakeOpts{
 		Agent:              "codex",
 		Time:               time.Date(2026, 8, 25, 0, 0, 0, 0, time.Local),
-		Input:              14976,
-		CacheRead:          11008,
-		Output:             224,
+		Input:              15000,
+		CacheRead:          12000,
+		Output:             200,
 		InputIncludesCache: true,
 	})
 	if !ok {
 		t.Fatal("make")
 	}
-	if u.Input != 3968 || u.CacheRead != 11008 || u.Total() != 14976+224 {
+	if u.Input != 3000 || u.CacheRead != 12000 || u.Total() != 15000+200 {
 		t.Fatalf("%+v total=%d", u, u.Total())
 	}
 }
@@ -111,12 +111,12 @@ func TestParseTimeHonoursExplicitOffset(t *testing.T) {
 }
 
 func TestParseTimeUnitScales(t *testing.T) {
-	want := "2026-08-24" // 1787550336 UTC
+	want := "2026-08-25" // 1787659200 is 2026-08-25 12:00 UTC
 	for _, v := range []int64{
-		1787550336,             // seconds
-		1787550336_000,         // milliseconds
-		1787550336_000_000,     // microseconds
-		1787550336_000_000_000, // nanoseconds
+		1787659200,             // seconds
+		1787659200_000,         // milliseconds
+		1787659200_000_000,     // microseconds
+		1787659200_000_000_000, // nanoseconds
 	} {
 		ts, ok := ParseTime(v)
 		if !ok {
@@ -266,8 +266,8 @@ func TestShortModelTrimsDateSuffix(t *testing.T) {
 func TestShortProjectKeepsDistinctPaths(t *testing.T) {
 	// Two machines' paths for the same project name must not collapse into
 	// one label, or their usage appears merged in the project view.
-	a := ShortProject("/home/someone/Developer/tool-lib/pay-module")
-	b := ShortProject("/Users/someone/Developer/tool-lib/pay-module")
+	a := ShortProject("/home/someone/src/proj")
+	b := ShortProject("/Users/someone/src/proj")
 	if a == b {
 		t.Fatalf("distinct paths collapsed to %q", a)
 	}

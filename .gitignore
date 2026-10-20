@@ -8,3 +8,6 @@ build/
 *.egg-info/
 __pycache__/
 .venv/
+*.test
+*.out
+*.prof
