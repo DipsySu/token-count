@@ -466,23 +466,31 @@ func grokMake(path, project string, ts time.Time, name string, u grokUsage, dedu
 	})
 }
 
+// geminiMessage is one message of a Gemini CLI chat recording.
+type geminiMessage struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp"`
+	Model     string `json:"model"`
+	Tokens    *struct {
+		Input                   int64 `json:"input"`
+		Output                  int64 `json:"output"`
+		Cached                  int64 `json:"cached"`
+		CachedContentTokenCount int64 `json:"cached_content_token_count"`
+		Thoughts                int64 `json:"thoughts"`
+		ThoughtsTokenCount      int64 `json:"thoughts_token_count"`
+		Tool                    int64 `json:"tool"`
+		ToolUsePromptTokenCount int64 `json:"tool_use_prompt_token_count"`
+	} `json:"tokens"`
+}
+
 func parseGemini(path string) ([]model.Usage, error) {
+	if filepath.Ext(path) == ".jsonl" {
+		return parseGeminiJSONL(path)
+	}
 	var rec struct {
-		Cwd      string `json:"cwd"`
-		Messages []struct {
-			Timestamp string `json:"timestamp"`
-			Model     string `json:"model"`
-			Tokens    *struct {
-				Input                   int64 `json:"input"`
-				Output                  int64 `json:"output"`
-				Cached                  int64 `json:"cached"`
-				CachedContentTokenCount int64 `json:"cached_content_token_count"`
-				Thoughts                int64 `json:"thoughts"`
-				ThoughtsTokenCount      int64 `json:"thoughts_token_count"`
-				Tool                    int64 `json:"tool"`
-				ToolUsePromptTokenCount int64 `json:"tool_use_prompt_token_count"`
-			} `json:"tokens"`
-		} `json:"messages"`
+		Cwd      string          `json:"cwd"`
+		Messages []geminiMessage `json:"messages"`
 	}
 	if ok, err := readJSON(path, &rec); !ok {
 		return nil, err
@@ -499,42 +507,99 @@ func parseGemini(path string) ([]model.Usage, error) {
 			continue
 		}
 		seq++
-		ts, ok := model.ParseTime(msg.Timestamp)
-		if !ok {
-			continue
-		}
-		cached := msg.Tokens.Cached
-		if cached == 0 {
-			cached = msg.Tokens.CachedContentTokenCount
-		}
-		thoughts := msg.Tokens.Thoughts
-		if thoughts == 0 {
-			thoughts = msg.Tokens.ThoughtsTokenCount
-		}
-		// tokens.tool is toolUsePromptTokenCount: uncached prompt-side input
-		// billed on top of tokens.input, never part of cached.
-		tool := msg.Tokens.Tool
-		if tool == 0 {
-			tool = msg.Tokens.ToolUsePromptTokenCount
-		}
-		if usage, ok := model.Make(model.MakeOpts{
-			Agent:                   "gemini",
-			Time:                    ts,
-			Model:                   msg.Model,
-			Project:                 rec.Cwd,
-			Input:                   msg.Tokens.Input + tool,
-			CacheRead:               cached,
-			Output:                  msg.Tokens.Output,
-			Reasoning:               thoughts,
-			InputIncludesCache:      true,
-			OutputIncludesReasoning: false,
-			Dedup:                   seqKey("gemini", session, seq),
-			Source:                  path,
-		}); ok {
+		if usage, ok := geminiUsage(path, rec.Cwd, msg, seqKey("gemini", session, seq)); ok {
 			out = append(out, usage)
 		}
 	}
 	return out, nil
+}
+
+// parseGeminiJSONL reads the JSONL chat recording of newer Gemini CLI
+// versions: a metadata line, then a line for every write of a message. A
+// message is written again each time it changes -- its tokens arrive after
+// the stream, its tool calls finish -- so the last line of an id is the
+// message. Lines of $set, $rewindTo or $patch edit metadata or the history
+// shown, not what was spent, and are skipped; so is every message but a
+// "gemini" reply, as ccusage does.
+func parseGeminiJSONL(path string) ([]model.Usage, error) {
+	session := "@" + pathTail(path, 3)
+	cwd := ""
+	var msgs []geminiMessage
+	at := map[string]int{}
+	err := forEachJSONL(path, func(line []byte) error {
+		var rec struct {
+			geminiMessage
+			Cwd string `json:"cwd"`
+		}
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return err
+		}
+		if cwd == "" {
+			cwd = rec.Cwd
+		}
+		m := rec.geminiMessage
+		if m.Type != "gemini" {
+			return nil
+		}
+		if i, ok := at[m.ID]; ok && m.ID != "" {
+			msgs[i] = m
+			return nil
+		}
+		at[m.ID] = len(msgs)
+		msgs = append(msgs, m)
+		return nil
+	})
+	var out []model.Usage
+	for i, m := range msgs {
+		if m.Tokens == nil {
+			continue
+		}
+		key := seqKey("gemini", session, i+1)
+		if m.ID != "" {
+			key = "gemini|" + session + "|" + m.ID
+		}
+		if usage, ok := geminiUsage(path, cwd, m, key); ok {
+			out = append(out, usage)
+		}
+	}
+	return out, err
+}
+
+// geminiUsage makes the record of one Gemini reply, or reports false for one
+// without a usable time or of no usage.
+func geminiUsage(path, cwd string, msg geminiMessage, dedup string) (model.Usage, bool) {
+	ts, ok := model.ParseTime(msg.Timestamp)
+	if !ok || msg.Tokens == nil {
+		return model.Usage{}, false
+	}
+	cached := msg.Tokens.Cached
+	if cached == 0 {
+		cached = msg.Tokens.CachedContentTokenCount
+	}
+	thoughts := msg.Tokens.Thoughts
+	if thoughts == 0 {
+		thoughts = msg.Tokens.ThoughtsTokenCount
+	}
+	// tokens.tool is toolUsePromptTokenCount: uncached prompt-side input
+	// billed on top of tokens.input, never part of cached.
+	tool := msg.Tokens.Tool
+	if tool == 0 {
+		tool = msg.Tokens.ToolUsePromptTokenCount
+	}
+	return model.Make(model.MakeOpts{
+		Agent:                   "gemini",
+		Time:                    ts,
+		Model:                   msg.Model,
+		Project:                 cwd,
+		Input:                   msg.Tokens.Input + tool,
+		CacheRead:               cached,
+		Output:                  msg.Tokens.Output,
+		Reasoning:               thoughts,
+		InputIncludesCache:      true,
+		OutputIncludesReasoning: false,
+		Dedup:                   dedup,
+		Source:                  path,
+	})
 }
 
 func parseOpenCode(path string) ([]model.Usage, error) {

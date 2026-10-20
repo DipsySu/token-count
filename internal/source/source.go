@@ -300,7 +300,7 @@ func Infos() []model.SourceInfo {
 		{"claude", "Claude Code session jsonl"},
 		{"codex", "Codex rollout jsonl (sessions + archived_sessions)"},
 		{"grok", "Grok turn_completed.usage"},
-		{"gemini", "Gemini CLI session json"},
+		{"gemini", "Gemini CLI chats json/jsonl"},
 		{"opencode", "OpenCode assistant messages"},
 	}
 	var out []model.SourceInfo
@@ -442,7 +442,7 @@ func named(name string) matcher {
 }
 
 func geminiChat(path string, d fs.DirEntry) bool {
-	if d.IsDir() || filepath.Ext(path) != ".json" {
+	if ext := filepath.Ext(path); d.IsDir() || (ext != ".json" && ext != ".jsonl") {
 		return false
 	}
 	return filepath.Base(filepath.Dir(path)) == "chats"
