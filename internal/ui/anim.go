@@ -13,6 +13,11 @@ import (
 // their full value from the first frame; only the bar length moves.
 const barAnimDur = 300 * time.Millisecond
 
+// barEaseMinWidth is the narrowest terminal that still runs the view-switch
+// bar ease-in. Below this the bar column is too short for the motion to read,
+// so bars draw at full length immediately (same as --no-anim for that part).
+const barEaseMinWidth = 40
+
 // animTick is the frame rate while a bar ease-in (or the scan spinner) runs.
 // Matching the existing spinner keeps one ticker path for both.
 const animTick = 90 * time.Millisecond
@@ -49,7 +54,7 @@ func (m Model) frameNow() time.Time {
 // barFrac is how far the table bars have eased in, 0..1. Settled (1) is also
 // what a non-animated render uses, so a finished ease matches --no-anim.
 func (m Model) barFrac() float64 {
-	if !m.animEnabled() || m.barAnimAt.IsZero() {
+	if !m.animEnabled() || m.width < barEaseMinWidth || m.barAnimAt.IsZero() {
 		return 1
 	}
 	elapsed := m.frameNow().Sub(m.barAnimAt)
@@ -64,7 +69,7 @@ func (m Model) barFrac() float64 {
 
 // barsAnimating is true while a view-switch ease-in still has frames to draw.
 func (m Model) barsAnimating() bool {
-	if !m.animEnabled() || m.barAnimAt.IsZero() {
+	if !m.animEnabled() || m.width < barEaseMinWidth || m.barAnimAt.IsZero() {
 		return false
 	}
 	return m.frameNow().Sub(m.barAnimAt) < barAnimDur
@@ -79,7 +84,7 @@ func easeOutCubic(t float64) float64 {
 // startBarAnim begins a ~300ms bar ease-in when animations are on. Calling it
 // from reset means a view or span change eases in; filter refreshes do not.
 func (m *Model) startBarAnim() {
-	if !m.animEnabled() {
+	if !m.animEnabled() || m.width < barEaseMinWidth {
 		m.barAnimAt = time.Time{}
 		return
 	}

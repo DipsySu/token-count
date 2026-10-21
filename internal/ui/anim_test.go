@@ -60,6 +60,24 @@ func TestAnimGatesOffMeansNoTicks(t *testing.T) {
 	}
 }
 
+// TestBarEaseSkippedWhenNarrowerThan40 pins dipsy's gate: below barEaseMinWidth
+// the view-switch ease must not run, even when animations are otherwise on.
+func TestBarEaseSkippedWhenNarrowerThan40(t *testing.T) {
+	withFancy(t, true)
+	m := newTestModel(t, barEaseMinWidth-1, 24)
+	m.opts.NoAnim = false
+	m.startBarAnim()
+	if !m.barAnimAt.IsZero() {
+		t.Fatal("startBarAnim started an ease on a <40-col terminal")
+	}
+	if m.barFrac() != 1 {
+		t.Fatalf("barFrac=%v, want 1 when narrower than 40", m.barFrac())
+	}
+	if m.barsAnimating() {
+		t.Fatal("barsAnimating true when narrower than 40")
+	}
+}
+
 // TestBarEaseSettledEqualsNoAnim asserts the pure-render contract: at t>=300ms
 // the frame matches a model that never animated, at every golden width.
 func TestBarEaseSettledEqualsNoAnim(t *testing.T) {
