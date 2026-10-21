@@ -290,7 +290,7 @@ func (m Model) renderRow(b model.Bucket, cols []col, scale int64, st Styles, sel
 				cell = st.Child.Render(cell)
 			}
 		case "bar":
-			cell = renderBar(t.Total(), scale, c.width, st)
+			cell = renderBar(t.Total(), scale, c.width, st, m.barFrac())
 		case "in":
 			cell = st.Child.Render(padCol(dashZero(t.Input), c.width, true))
 		case "cacher":
@@ -404,16 +404,26 @@ func (m Model) totalRow(cols []col, st Styles, width int) string {
 	return underlay(padRight(" "+strings.Join(cells, " "), width), st.Total)
 }
 
-func renderBar(n, scale int64, width int, st Styles) string {
+func renderBar(n, scale int64, width int, st Styles, frac float64) string {
 	if width <= 0 {
 		return ""
 	}
 	filled := strings.TrimRight(model.Bar(n, scale, width), " ")
-	rest := width - len([]rune(filled))
+	runes := []rune(filled)
+	frac = clamp01(frac)
+	nFill := int(float64(len(runes))*frac + 0.5)
+	if nFill < 0 {
+		nFill = 0
+	}
+	if nFill > len(runes) {
+		nFill = len(runes)
+	}
+	shown := string(runes[:nFill])
+	rest := width - nFill
 	if rest < 0 {
 		rest = 0
 	}
-	return gradientBar(filled, rest, rampVolume(), st.Track)
+	return gradientBar(shown, rest, rampVolume(), st.Track)
 }
 
 func dashZero(n int64) string {

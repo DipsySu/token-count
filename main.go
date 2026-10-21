@@ -85,6 +85,7 @@ func run(name string, args []string) error {
 	plain := fs.Bool("plain", false, "print a table instead of the TUI")
 	noCache := fs.Bool("no-cache", false, "neither read nor write ~/.cache/token-count")
 	noCat := fs.Bool("no-cat", false, "hide the mascot and gradients")
+	noAnim := fs.Bool("no-anim", false, "disable scan progress and bar ease-in animations")
 	showVersion := fs.Bool("version", false, "print version")
 	fs.BoolVar(showVersion, "V", false, "print version")
 
@@ -135,6 +136,7 @@ func run(name string, args []string) error {
 		Until:   until,
 		NoCache: *noCache,
 		NoCat:   *noCat,
+		NoAnim:  *noAnim,
 		Name:    name,
 		Version: version,
 		Now:     clock,
@@ -267,6 +269,7 @@ OPTIONS
       --plain          table instead of TUI
       --no-cache       neither read nor write ~/.cache/token-count
       --no-cat         hide the mascot
+      --no-anim        disable scan progress and bar ease-in
   -V, --version
 
 KEYS (TUI)
@@ -307,6 +310,7 @@ OUTPUT
 ENVIRONMENT
   NO_COLOR             disable all colour
   TCOUNT_NO_FANCY      disable gradients and the mascot only
+  TCOUNT_NO_ANIM       disable scan progress and bar ease-in only
   CLICOLOR_FORCE       keep colour when piping (for less -R)
 
 NOTES
