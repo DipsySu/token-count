@@ -355,11 +355,16 @@ func fitSeries(vals []int64, width int) []int64 {
 	return vals[len(vals)-width:]
 }
 
-// loadingBody is the scan screen in h lines.
+// loadingBody is the scan screen in h lines. With animations on it shows a
+// gradient progress bar driven by the scan callback; with them off it keeps
+// the previous spinner-only layout so --no-anim / TCOUNT_NO_FANCY stay
+// byte-identical to the pre-animation render once spin is left at 0.
 func (m Model) loadingBody(w, h int, st Styles) []string {
 	frame := spinner[m.spin%len(spinner)]
 	var out []string
-	if m.cat && fancyEnabled() && w >= 52 && h >= 4 {
+	if m.animEnabled() {
+		out = m.loadingAnim(w, h, frame, st)
+	} else if m.cat && fancyEnabled() && w >= 52 && h >= 4 {
 		// The cat blinks and swishes while the scan runs, so the wait has
 		// something to watch other than a spinner. It is four lines tall.
 		art := catStrip(catBlink(m.spin / 3))
@@ -387,6 +392,35 @@ func (m Model) loadingBody(w, h int, st Styles) []string {
 		out = append(out, "")
 	}
 	return out[:max(h, 0)]
+}
+
+// loadingAnim is the animated scan screen: progress bar first, then the
+// blinking cat when there is room, otherwise the path hints.
+func (m Model) loadingAnim(w, h int, frame string, st Styles) []string {
+	out := []string{m.scanProgressLine(w, st)}
+	if m.cat && w >= 52 && h >= 5 {
+		art := catStrip(catBlink(m.spin / 3))
+		notes := []string{
+			st.Dim.Render(frame + " scanning session logs"),
+			st.Faint.Render("~/.claude  ~/.codex  ~/.grok"),
+			st.Faint.Render("~/.gemini  ~/.local/share/opencode"),
+			"",
+		}
+		for i, ln := range art {
+			line := "  " + ln + "   "
+			if i < len(notes) {
+				line += notes[i]
+			}
+			out = append(out, truncate(line, w))
+		}
+		return out
+	}
+	out = append(out,
+		st.Dim.Render(truncate("  "+frame+"  scanning session logs", w)),
+		"",
+		st.Faint.Render(truncate("     ~/.claude  ~/.codex  ~/.grok  ~/.gemini  ~/.local/share/opencode", w)),
+	)
+	return out
 }
 
 func (m Model) footer(w int, st Styles) string {

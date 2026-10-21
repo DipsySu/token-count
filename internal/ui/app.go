@@ -23,6 +23,9 @@ type Options struct {
 	Until   *time.Time
 	NoCache bool
 	NoCat   bool
+	// NoAnim turns off the scan progress bar and the view-switch bar ease-in.
+	// Gradients and the mascot still follow TCOUNT_NO_FANCY / --no-cat.
+	NoAnim bool
 	// Name is what the binary was invoked as, so an installed alias is what
 	// the UI calls itself rather than a hardcoded name.
 	Name    string
@@ -53,6 +56,12 @@ type loadedMsg struct {
 }
 
 type tickMsg time.Time
+
+// progressMsg is one agent's scan progress, forwarded from source.CollectStats.
+type progressMsg struct {
+	agent       string
+	done, total int
+}
 
 // clockMsg is the slow tick on which the TUI notices that the local date has
 // changed while it stayed open.
@@ -149,7 +158,27 @@ type Model struct {
 	dupToks int64
 	issues  []source.Issue
 
+	// Scan progress for the loading screen. scanProg is per-agent done/total;
+	// scanDone/scanTotal are their sums; scanAgent is the last reporter.
+	scanProg            map[string][2]int
+	scanDone, scanTotal int
+	scanAgent           string
+	pipe                *scanPipe
+
+	// barAnimAt is when the current view-switch bar ease-in started; zero
+	// means settled. frameAt, when set, is the clock View reads so tests can
+	// dump a deterministic mid-ease or mid-scan frame.
+	barAnimAt time.Time
+	frameAt   time.Time
+
 	memo *memo
+}
+
+// scanPipe is the only shareable bit of load state: Bubble Tea copies the
+// Model by value, so the collector goroutine and waitScan must agree on one
+// channel pointer rather than a field of the copy.
+type scanPipe struct {
+	ch chan tea.Msg
 }
 
 func RunTUI(opts Options) error {
@@ -184,13 +213,21 @@ func New(opts Options) Model {
 		snapshot: map[string]aggregate.Snap{},
 		input:    newSearchInput(),
 		memo:     &memo{},
+		pipe:     &scanPipe{},
+		scanProg: map[string][2]int{},
 	}
 }
 
-func (m Model) Init() tea.Cmd { return tea.Batch(m.load(), tick(), clockTick()) }
+func (m Model) Init() tea.Cmd {
+	cmds := []tea.Cmd{m.load(), clockTick()}
+	if m.animEnabled() {
+		cmds = append(cmds, tick())
+	}
+	return tea.Batch(cmds...)
+}
 
 func tick() tea.Cmd {
-	return tea.Tick(90*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) })
+	return tea.Tick(animTick, func(t time.Time) tea.Msg { return tickMsg(t) })
 }
 
 func clockTick() tea.Cmd {
@@ -199,11 +236,40 @@ func clockTick() tea.Cmd {
 
 func (m Model) load() tea.Cmd {
 	opts := m.opts
-	return func() tea.Msg {
+	if m.pipe == nil {
+		m.pipe = &scanPipe{}
+	}
+	ch := make(chan tea.Msg, 64)
+	m.pipe.ch = ch
+	go func() {
 		c := cache.New("", !opts.NoCache)
-		recs, stats := source.CollectStats(opts.Agents, c, nil)
+		recs, stats := source.CollectStats(opts.Agents, c, func(agent string, done, total int) {
+			select {
+			case ch <- progressMsg{agent: agent, done: done, total: total}:
+			default:
+				// Drop a progress tick rather than stall the scan when the
+				// UI is behind; the next one or the loadedMsg will catch up.
+			}
+		})
 		_ = c.Save()
-		return loadedMsg{records: recs, dropped: stats.Dropped, dupToks: stats.DroppedTokens, issues: stats.Issues}
+		ch <- loadedMsg{records: recs, dropped: stats.Dropped, dupToks: stats.DroppedTokens, issues: stats.Issues}
+	}()
+	return waitScan(ch)
+}
+
+// waitScan reads the next scan message. load starts the collector; each
+// progress message re-arms this so the UI keeps draining the pipe until
+// loadedMsg arrives.
+func waitScan(ch <-chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		if ch == nil {
+			return nil
+		}
+		msg, ok := <-ch
+		if !ok {
+			return nil
+		}
+		return msg
 	}
 }
 
@@ -228,9 +294,20 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.clamp()
 
 	case tickMsg:
-		if m.loading {
+		if m.loading && m.animEnabled() {
 			m.spin++
 			return m, tick()
+		}
+		if m.barsAnimating() {
+			return m, tick()
+		}
+		// Settled: clear the start so later frames skip the ease path.
+		m.barAnimAt = time.Time{}
+
+	case progressMsg:
+		m.applyProgress(msg.agent, msg.done, msg.total)
+		if m.pipe != nil {
+			return m, waitScan(m.pipe.ch)
 		}
 
 	case clockMsg:
@@ -310,7 +387,14 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, cmd
 	case "r":
 		m.loading = true
-		return m, tea.Batch(m.load(), tick())
+		m.barAnimAt = time.Time{}
+		m.scanProg = map[string][2]int{}
+		m.scanDone, m.scanTotal, m.scanAgent = 0, 0, ""
+		cmds := []tea.Cmd{m.load()}
+		if m.animEnabled() {
+			cmds = append(cmds, tick())
+		}
+		return m, tea.Batch(cmds...)
 
 	case "left", "h", "[":
 		m.setPeriod(prevPeriod(m.period))
@@ -385,6 +469,9 @@ func (m Model) onKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "G", "end":
 		m.cursor = len(m.flat) - 1
 		m.clamp()
+	}
+	if m.barsAnimating() {
+		return m, tick()
 	}
 	return m, nil
 }
@@ -471,6 +558,7 @@ func (m *Model) setView(v aggregate.View) {
 func (m *Model) reset() {
 	m.cursor, m.offset = 0, 0
 	m.kept = selection{}
+	m.startBarAnim()
 	m.recompute()
 }
 

@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+
+	tea "github.com/charmbracelet/bubbletea"
 	"testing"
 	"time"
 
@@ -63,7 +65,23 @@ func loaded(t *testing.T, w, h int) Model {
 	t.Helper()
 	m := New(Options{Period: aggregate.PeriodDay, Agents: model.Agents, NoCache: true, Name: "tcount", Now: testClock})
 	m.width, m.height = w, h
-	return send(m, m.load()())
+	return drainLoad(m)
+}
+
+// drainLoad runs load and follows every progress/loaded command the way the
+// Bubble Tea loop would, so a scan that reports progress still ends loaded.
+func drainLoad(m Model) Model {
+	cmd := m.load()
+	for cmd != nil {
+		msg := cmd()
+		if msg == nil {
+			return m
+		}
+		var next tea.Model
+		next, cmd = m.Update(msg)
+		m = next.(Model)
+	}
+	return m
 }
 
 // When some logs could not be read, the totals on screen are short, and the
@@ -98,7 +116,7 @@ func TestTUIWarnsThatTotalsAreALowerBound(t *testing.T) {
 	// Once the files read cleanly, the next scan's notice is the dedup one.
 	writeMessage(t, dir, "msg_c.json", "msg_3")
 	writeMessage(t, dir, "msg_d.json", "msg_4")
-	m = send(m, m.load()())
+	m = drainLoad(m)
 	body = stripANSI(m.View())
 	if strings.Contains(body, "⚠") {
 		t.Errorf("a rescan that read everything still warns:\n%s", body)
