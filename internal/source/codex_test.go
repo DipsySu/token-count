@@ -204,8 +204,8 @@ func TestCodexUntimedEventIsNoBaseline(t *testing.T) {
 	}
 }
 
-// Positions count exchanges rather than events, so a re-publication takes no
-// number of its own.
+// An exchange is keyed by its time, model and usage, so a copy in another
+// log matches it; a re-publication is no exchange and gets no key.
 func TestCodexKeysCountExchanges(t *testing.T) {
 	a := codexTok(100, 0, 10)
 	path := writeCodexLog(t,
@@ -218,7 +218,7 @@ func TestCodexKeysCountExchanges(t *testing.T) {
 	for _, r := range recs {
 		keys = append(keys, r.Dedup)
 	}
-	if got, want := strings.Join(keys, " "), "codex|s-1|1 codex|s-1|2"; got != want {
+	if got, want := strings.Join(keys, " "), "codex|use|2026-08-25T01:00:01.000Z|gpt-5.6-sol|100|0|0|10|0 codex|use|2026-08-25T01:00:03.000Z|gpt-5.6-sol|200|0|0|20|0"; got != want {
 		t.Fatalf("keys %q, want %q", got, want)
 	}
 }

@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Cross-check tcount against ccusage on the same logs.
+
+    scripts/crosscheck.py                 # the real logs under $HOME
+    scripts/crosscheck.py --home DIR      # a fixture tree laid out like a home
+                                          # (DIR/.claude, DIR/.codex, DIR/.grok, DIR/.gemini)
+
+Both tools are pointed at the same directories through their environment
+variables, every field is compared per agent, and the exit status is 1 if any
+field differs for a reason not listed in KNOWN below.
+"""
+import argparse, json, os, subprocess, sys
+
+AGENTS = ["claude", "codex", "grok", "gemini"]
+# tcount snapshot.all field -> ccusage totals field
+FIELDS = [("input", "inputTokens"), ("cache_read", "cacheReadTokens"),
+          ("cache_write", "cacheCreationTokens"), ("output", "outputTokens"),
+          ("reasoning", ("reasoningOutputTokens", "reasoningTokens")),
+          ("total", "totalTokens")]
+
+# Documented differences in how the two tools *report* the same usage. Each
+# maps (agent, field) to (reason, f(tcount) -> the value ccusage should show).
+# A diff is accepted only if ccusage shows exactly that value.
+KNOWN = {
+    ("gemini", "output"): (
+        "ccusage keeps Gemini thoughts out of outputTokens (adds them to the "
+        "total only); tcount folds reasoning into output",
+        lambda t: t["output"] - t["reasoning"]),
+}
+
+def env_for(home):
+    env = dict(os.environ)
+    if home:
+        home = os.path.abspath(home)
+        env.update(CLAUDE_CONFIG_DIR=f"{home}/.claude", CODEX_HOME=f"{home}/.codex",
+                   GROK_HOME=f"{home}/.grok", GEMINI_DIR=f"{home}/.gemini",
+                   GEMINI_DATA_DIR=f"{home}/.gemini/tmp")
+    return env
+
+def tcount(agent, env, repo):
+    out = subprocess.run(["go", "run", ".", "all", "--json", "--no-cache", "-a", agent],
+                         cwd=repo, env=env, capture_output=True, text=True, check=True).stdout
+    return json.loads(out)["snapshot"]["all"]
+
+# Pinned so the gate cannot change under us; bump deliberately.
+CCUSAGE = "ccusage@20.0.37"
+
+def ccusage(agent, env):
+    """ccusage totals for one agent. Any failure is fatal: a gate that reads a
+    broken run as zeros would pass falsely. ccusage reports an agent with no
+    logs as valid JSON with zero totals and exit 0, so that stays allowed."""
+    p = subprocess.run(["npx", "-y", CCUSAGE, agent, "daily", "--json", "--offline"],
+                       env=env, capture_output=True, text=True)
+    if p.returncode != 0 or not p.stdout.strip():
+        sys.exit(f"FAIL: {CCUSAGE} {agent} exited {p.returncode} with "
+                 f"{'empty' if not p.stdout.strip() else 'unusable'} output:\n{p.stderr.strip()[-2000:]}")
+    try:
+        totals = json.loads(p.stdout).get("totals")
+    except json.JSONDecodeError as e:
+        sys.exit(f"FAIL: {CCUSAGE} {agent} printed invalid JSON: {e}")
+    if not isinstance(totals, dict):
+        sys.exit(f"FAIL: {CCUSAGE} {agent} output has no totals")
+    return totals
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--home", help="fixture dir laid out like $HOME")
+    ap.add_argument("--agents", default=",".join(AGENTS))
+    a = ap.parse_args()
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    env = env_for(a.home)
+    bad = 0
+    print(f"{'agent':7} {'field':12} {'tcount':>14} {'ccusage':>14} {'diff':>12}  status")
+    for agent in a.agents.split(","):
+        if a.home and not os.path.isdir(os.path.join(a.home, "." + agent)):
+            # ccusage refuses a missing data dir; say so instead of comparing zeros
+            print(f"{agent:7} {'-':12} skipped: fixture has no .{agent}/")
+            continue
+        t, c = tcount(agent, env, repo), ccusage(agent, env)
+        for tf, cf in FIELDS:
+            names = cf if isinstance(cf, tuple) else (cf,)
+            hit = next((n for n in names if n in c), None)
+            if hit is None and isinstance(cf, tuple):
+                # ccusage does not report reasoning for this agent's totals
+                print(f"{agent:7} {tf:12} {t.get(tf, 0):>14,} {'-':>14} {'':>12}  n/a (ccusage omits)")
+                continue
+            tv, cv = t.get(tf, 0), int(c.get(hit, 0) or 0) if hit else 0
+            status = "ok"
+            if tv != cv:
+                known = KNOWN.get((agent, tf))
+                if known and known[1](t) == cv:
+                    status = "known: " + known[0]
+                else:
+                    status, bad = "MISMATCH", bad + 1
+            print(f"{agent:7} {tf:12} {tv:>14,} {cv:>14,} {tv - cv:>+12,}  {status}")
+    print("FAIL: %d unexplained mismatch(es)" % bad if bad else "PASS")
+    return 1 if bad else 0
+
+if __name__ == "__main__":
+    sys.exit(main())

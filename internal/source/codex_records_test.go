@@ -38,12 +38,12 @@ func dedupKeys(recs []model.Usage) string {
 }
 
 // A log written before Codex wrote records parses exactly as it did: one
-// record per exchange, at the token_count event's time, keyed by thread and
-// position.
+// record per exchange, at the token_count event's time, keyed by its time,
+// model and usage.
 func TestCodexLegacyLogUnchanged(t *testing.T) {
 	recs := parseFile(t, parseCodex, filepath.Join("testdata", "codex_republished.jsonl"))
-	const thread = "codex|019e0000-aaaa-7000-8000-000000000001|"
-	if got, want := dedupKeys(recs), thread+"1 "+thread+"2 "+thread+"3 "+thread+"4"; got != want {
+	want := "codex|use|2026-08-25T02:00:05.000Z|gpt-5.6-sol|1000|600|0|50|10 codex|use|2026-08-25T02:00:09.000Z|gpt-5.6-sol|1200|900|0|30|0 codex|use|2026-08-27T09:00:07.000Z|gpt-5.6-sol|900|100|0|20|5 codex|use|2026-08-27T09:00:12.000Z|gpt-5.6-sol|1100|900|0|40|0"
+	if got := dedupKeys(recs); got != want {
 		t.Fatalf("keys %q, want %q", got, want)
 	}
 	for i, want := range []string{"2026-08-25T02:00:05Z", "2026-08-25T02:00:09Z", "2026-08-27T09:00:07Z", "2026-08-27T09:00:12Z"} {
@@ -101,7 +101,7 @@ func TestCodexMixedLogCountsEveryResponseOnce(t *testing.T) {
 	if total, calls := sumOf(recs); total != 110+220+330+440 || calls != 4 {
 		t.Fatalf("got %d tokens over %d calls, want %d over 4", total, calls, 110+220+330+440)
 	}
-	if got, want := dedupKeys(recs), "codex|s-1|1 codex|s-1|2 codex|resp|resp_c codex|resp|resp_d"; got != want {
+	if got, want := dedupKeys(recs), "codex|use|2026-08-25T01:00:01.000Z|gpt-5.6-sol|100|0|0|10|0 codex|use|2026-08-25T01:00:02.000Z|gpt-5.6-sol|200|0|0|20|0 codex|resp|resp_c codex|resp|resp_d"; got != want {
 		t.Fatalf("keys %q, want %q", got, want)
 	}
 	for i, want := range []time.Time{codexAt(1, false), codexAt(2, false), codexAt(10, true), codexAt(12, true)} {
@@ -186,7 +186,7 @@ func TestCodexRecordWithoutResponseID(t *testing.T) {
 		tokenCount(3, c, codexTok(600, 0, 60)),
 	)
 	recs := parseFile(t, parseCodex, path)
-	if got, want := dedupKeys(recs), "codex|s-1|1 codex|resp|resp_b codex|s-1|3"; got != want {
+	if got, want := dedupKeys(recs), "codex|use|2026-08-25T01:00:01.000Z|gpt-5.6-sol|100|0|0|10|0 codex|resp|resp_b codex|s-1|3"; got != want {
 		t.Fatalf("keys %q, want %q", got, want)
 	}
 }

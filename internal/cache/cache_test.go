@@ -124,7 +124,7 @@ func TestLoadIgnoresOtherVersions(t *testing.T) {
 func TestDefaultPathNamesTheVersion(t *testing.T) {
 	root := t.TempDir()
 	t.Setenv("XDG_CACHE_HOME", root)
-	if got, want := DefaultPath(), filepath.Join(root, "token-count", "index-v7.gob"); got != want {
+	if got, want := DefaultPath(), filepath.Join(root, "token-count", "index-v9.gob"); got != want {
 		t.Fatalf("DefaultPath() = %s, want %s", got, want)
 	}
 }

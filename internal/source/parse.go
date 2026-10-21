@@ -14,6 +14,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/klauspost/compress/zstd"
+
 	"token-count/internal/model"
 )
 
@@ -160,11 +162,11 @@ func parseCodex(path string) ([]model.Usage, error) {
 	var out []model.Usage
 	modelName := ""
 	cwd := ""
-	// token_count events carry no response id, so identity is the thread plus
-	// the position of the exchange within it. Both survive a file being copied
-	// elsewhere, which is what deduplication across roots needs. A timestamp
-	// is not enough on its own: consecutive events can share one. A record
-	// that lacks its response id is keyed the same way.
+	// token_count events carry no response id, so an exchange is keyed by its
+	// time, model and usage (see below), which also match its copies in other
+	// logs. A record that lacks its response id is keyed by the thread plus
+	// its position. Both survive a file being copied elsewhere. A timestamp is
+	// not enough on its own: consecutive events can share one.
 	//
 	// The thread is the id in the log's first session_meta, which precedes any
 	// usage event; the filename stem stands in if a log lacks it. session_id
@@ -185,7 +187,7 @@ func parseCodex(path string) ([]model.Usage, error) {
 		seq++
 		id := thread
 		if id == "" {
-			id = strings.TrimSuffix(filepath.Base(path), ".jsonl")
+			id = strings.TrimSuffix(strings.TrimSuffix(filepath.Base(path), ".zst"), ".jsonl")
 		}
 		return seqKey("codex", id, seq)
 	}
@@ -194,18 +196,26 @@ func parseCodex(path string) ([]model.Usage, error) {
 	// recorded is set at the log's first token_usage_record, from where on
 	// token_count events are not counted.
 	recorded := false
+	// A fork or subagent names its parent in its first session_meta. Its
+	// token_count events are tracked, so that the burst of parent history it
+	// replays at the head of the log can be told from its own usage.
+	child := false
+	var spawn time.Time
+	var events []int
 	err := forEachJSONL(path, func(line []byte) error {
 		var rec struct {
 			Timestamp string `json:"timestamp"`
 			Type      string `json:"type"`
 			Payload   struct {
-				Type           string       `json:"type"`
-				ID             string       `json:"id"`
-				Model          string       `json:"model"`
-				Cwd            string       `json:"cwd"`
-				SessionID      string       `json:"session_id"`
-				ResponseID     string       `json:"response_id"`
-				Usage          *codexTokens `json:"usage"`
+				Type           string          `json:"type"`
+				ID             string          `json:"id"`
+				Model          string          `json:"model"`
+				Cwd            string          `json:"cwd"`
+				ForkedFromID   string          `json:"forked_from_id"`
+				Source         json.RawMessage `json:"source"`
+				SessionID      string          `json:"session_id"`
+				ResponseID     string          `json:"response_id"`
+				Usage          *codexTokens    `json:"usage"`
 				ThreadSettings *struct {
 					Model string `json:"model"`
 				} `json:"thread_settings"`
@@ -224,6 +234,8 @@ func parseCodex(path string) ([]model.Usage, error) {
 		switch {
 		case rec.Type == "session_meta":
 			if thread == "" {
+				child = codexParent(rec.Payload.ForkedFromID, rec.Payload.Source) != ""
+				spawn, _ = model.ParseTime(rec.Timestamp)
 				thread = rec.Payload.ID
 				if thread == "" {
 					thread = rec.Payload.SessionID
@@ -285,14 +297,90 @@ func parseCodex(path string) ([]model.Usage, error) {
 		if !counted {
 			return nil
 		}
-		key := position()
+		position()
 		if usage, ok := codexCall(path, ts, modelName, use); ok {
-			usage.Dedup = key
+			// Branches and subagents copy token_count events into their own
+			// logs, so an exchange is known by what it says, not where it
+			// sits: its time, model and usage, as ccusage matches them.
+			usage.Dedup = fmt.Sprintf("codex|use|%s|%s|%d|%d|%d|%d|%d", rec.Timestamp, modelName,
+				use.InputTokens, use.CachedInputTokens, use.CacheWriteInputTokens, use.OutputTokens, use.ReasoningOutputTokens)
+			events = append(events, len(out))
 			out = append(out, usage)
 		}
 		return nil
 	})
+	if child {
+		out = dropReplayedBurst(out, events, spawn)
+	}
 	return backfillProject(out, cwd), err
+}
+
+// codexParent returns the thread a session was forked or spawned from, or ""
+// for a session of its own. source is a string ("cli", "exec") for those.
+func codexParent(forkedFrom string, source json.RawMessage) string {
+	if forkedFrom != "" {
+		return forkedFrom
+	}
+	var src struct {
+		Subagent struct {
+			ThreadSpawn struct {
+				ParentThreadID string `json:"parent_thread_id"`
+			} `json:"thread_spawn"`
+		} `json:"subagent"`
+	}
+	if json.Unmarshal(source, &src) != nil {
+		return ""
+	}
+	return src.Subagent.ThreadSpawn.ParentThreadID
+}
+
+// replayGap is the longest pause inside a burst of replayed usage. Codex
+// writes a child's copy of its parent's history in one go, stamped with the
+// moment of the fork, while the child's own first exchange follows a real
+// pause of seconds. ccusage uses the same bound.
+const replayGap = time.Second
+
+// dropReplayedBurst removes the parent history a fork or subagent replayed at
+// the head of its log: its leading token_count records, when the first two
+// were written within replayGap of each other, up to the first real pause.
+// Their timestamps were rewritten, so matching across files cannot catch them.
+//
+// ccusage first lines the child's usage up against the parent's log and falls
+// back to this burst when it cannot; counting each file on its own, tcount
+// uses the burst alone, which drops the same events whenever Codex rewrote
+// the replay.
+//
+// A replay of a single event has no second one to pair with, so the burst
+// also starts when the first event lands within replayGap of spawn, the time
+// of the child's session_meta, where Codex stamps the replay.
+func dropReplayedBurst(out []model.Usage, events []int, spawn time.Time) []model.Usage {
+	within := func(a, b int) bool {
+		d := out[b].Time.Sub(out[a].Time)
+		return d >= 0 && d <= replayGap
+	}
+	if len(events) == 0 {
+		return out
+	}
+	d := out[events[0]].Time.Sub(spawn)
+	atSpawn := !spawn.IsZero() && d >= 0 && d <= replayGap
+	if !atSpawn && (len(events) < 2 || !within(events[0], events[1])) {
+		return out
+	}
+	n := 1
+	for n < len(events) && within(events[n-1], events[n]) {
+		n++
+	}
+	drop := map[int]bool{}
+	for _, i := range events[:n] {
+		drop[i] = true
+	}
+	kept := out[:0]
+	for i, r := range out {
+		if !drop[i] {
+			kept = append(kept, r)
+		}
+	}
+	return kept
 }
 
 // codexCall makes the record of one call from its Codex usage block, or
@@ -466,21 +554,31 @@ func grokMake(path, project string, ts time.Time, name string, u grokUsage, dedu
 	})
 }
 
+// geminiMessage is one message of a Gemini CLI chat recording.
+type geminiMessage struct {
+	ID        string `json:"id"`
+	Type      string `json:"type"`
+	Timestamp string `json:"timestamp"`
+	Model     string `json:"model"`
+	Tokens    *struct {
+		Input                   int64 `json:"input"`
+		Output                  int64 `json:"output"`
+		Cached                  int64 `json:"cached"`
+		CachedContentTokenCount int64 `json:"cached_content_token_count"`
+		Thoughts                int64 `json:"thoughts"`
+		ThoughtsTokenCount      int64 `json:"thoughts_token_count"`
+		Tool                    int64 `json:"tool"`
+		ToolUsePromptTokenCount int64 `json:"tool_use_prompt_token_count"`
+	} `json:"tokens"`
+}
+
 func parseGemini(path string) ([]model.Usage, error) {
+	if filepath.Ext(path) == ".jsonl" {
+		return parseGeminiJSONL(path)
+	}
 	var rec struct {
-		Cwd      string `json:"cwd"`
-		Messages []struct {
-			Timestamp string `json:"timestamp"`
-			Model     string `json:"model"`
-			Tokens    *struct {
-				Input                   int64 `json:"input"`
-				Output                  int64 `json:"output"`
-				Cached                  int64 `json:"cached"`
-				CachedContentTokenCount int64 `json:"cached_content_token_count"`
-				Thoughts                int64 `json:"thoughts"`
-				ThoughtsTokenCount      int64 `json:"thoughts_token_count"`
-			} `json:"tokens"`
-		} `json:"messages"`
+		Cwd      string          `json:"cwd"`
+		Messages []geminiMessage `json:"messages"`
 	}
 	if ok, err := readJSON(path, &rec); !ok {
 		return nil, err
@@ -497,36 +595,99 @@ func parseGemini(path string) ([]model.Usage, error) {
 			continue
 		}
 		seq++
-		ts, ok := model.ParseTime(msg.Timestamp)
-		if !ok {
-			continue
-		}
-		cached := msg.Tokens.Cached
-		if cached == 0 {
-			cached = msg.Tokens.CachedContentTokenCount
-		}
-		thoughts := msg.Tokens.Thoughts
-		if thoughts == 0 {
-			thoughts = msg.Tokens.ThoughtsTokenCount
-		}
-		if usage, ok := model.Make(model.MakeOpts{
-			Agent:                   "gemini",
-			Time:                    ts,
-			Model:                   msg.Model,
-			Project:                 rec.Cwd,
-			Input:                   msg.Tokens.Input,
-			CacheRead:               cached,
-			Output:                  msg.Tokens.Output,
-			Reasoning:               thoughts,
-			InputIncludesCache:      true,
-			OutputIncludesReasoning: false,
-			Dedup:                   seqKey("gemini", session, seq),
-			Source:                  path,
-		}); ok {
+		if usage, ok := geminiUsage(path, rec.Cwd, msg, seqKey("gemini", session, seq)); ok {
 			out = append(out, usage)
 		}
 	}
 	return out, nil
+}
+
+// parseGeminiJSONL reads the JSONL chat recording of newer Gemini CLI
+// versions: a metadata line, then a line for every write of a message. A
+// message is written again each time it changes -- its tokens arrive after
+// the stream, its tool calls finish -- so the last line of an id is the
+// message. Lines of $set, $rewindTo or $patch edit metadata or the history
+// shown, not what was spent, and are skipped; so is every message but a
+// "gemini" reply, as ccusage does.
+func parseGeminiJSONL(path string) ([]model.Usage, error) {
+	session := "@" + pathTail(path, 3)
+	cwd := ""
+	var msgs []geminiMessage
+	at := map[string]int{}
+	err := forEachJSONL(path, func(line []byte) error {
+		var rec struct {
+			geminiMessage
+			Cwd string `json:"cwd"`
+		}
+		if err := json.Unmarshal(line, &rec); err != nil {
+			return err
+		}
+		if cwd == "" {
+			cwd = rec.Cwd
+		}
+		m := rec.geminiMessage
+		if m.Type != "gemini" {
+			return nil
+		}
+		if i, ok := at[m.ID]; ok && m.ID != "" {
+			msgs[i] = m
+			return nil
+		}
+		at[m.ID] = len(msgs)
+		msgs = append(msgs, m)
+		return nil
+	})
+	var out []model.Usage
+	for i, m := range msgs {
+		if m.Tokens == nil {
+			continue
+		}
+		key := seqKey("gemini", session, i+1)
+		if m.ID != "" {
+			key = "gemini|" + session + "|" + m.ID
+		}
+		if usage, ok := geminiUsage(path, cwd, m, key); ok {
+			out = append(out, usage)
+		}
+	}
+	return out, err
+}
+
+// geminiUsage makes the record of one Gemini reply, or reports false for one
+// without a usable time or of no usage.
+func geminiUsage(path, cwd string, msg geminiMessage, dedup string) (model.Usage, bool) {
+	ts, ok := model.ParseTime(msg.Timestamp)
+	if !ok || msg.Tokens == nil {
+		return model.Usage{}, false
+	}
+	cached := msg.Tokens.Cached
+	if cached == 0 {
+		cached = msg.Tokens.CachedContentTokenCount
+	}
+	thoughts := msg.Tokens.Thoughts
+	if thoughts == 0 {
+		thoughts = msg.Tokens.ThoughtsTokenCount
+	}
+	// tokens.tool is toolUsePromptTokenCount: uncached prompt-side input
+	// billed on top of tokens.input, never part of cached.
+	tool := msg.Tokens.Tool
+	if tool == 0 {
+		tool = msg.Tokens.ToolUsePromptTokenCount
+	}
+	return model.Make(model.MakeOpts{
+		Agent:                   "gemini",
+		Time:                    ts,
+		Model:                   msg.Model,
+		Project:                 cwd,
+		Input:                   msg.Tokens.Input + tool,
+		CacheRead:               cached,
+		Output:                  msg.Tokens.Output,
+		Reasoning:               thoughts,
+		InputIncludesCache:      true,
+		OutputIncludesReasoning: false,
+		Dedup:                   dedup,
+		Source:                  path,
+	})
 }
 
 func parseOpenCode(path string) ([]model.Usage, error) {
@@ -693,7 +854,17 @@ func forEachJSONL(path string, fn func([]byte) error) error {
 		return err
 	}
 	defer f.Close()
-	lr := lineReader{r: bufio.NewReaderSize(f, 64<<10)}
+	var r io.Reader = f
+	if strings.HasSuffix(path, ".zst") {
+		// Codex compresses old rollouts with zstd.
+		zr, err := zstd.NewReader(f)
+		if err != nil {
+			return err
+		}
+		defer zr.Close()
+		r = zr
+	}
+	lr := lineReader{r: bufio.NewReaderSize(r, 64<<10)}
 	var (
 		skipped *longLinesError
 		corrupt *corruptLinesError

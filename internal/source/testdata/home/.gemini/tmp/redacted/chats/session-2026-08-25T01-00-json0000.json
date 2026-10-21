@@ -1,0 +1,5 @@
+{"sessionId":"00000000-0000-0000-0000-000000000000","projectHash":"redacted","cwd":"/home/u/proj","startTime":"2026-08-25T01:00:00.000Z","lastUpdated":"2026-08-25T01:00:05.000Z","messages":[
+{"id":"m1","timestamp":"2026-08-25T01:00:00.000Z","type":"user","content":"list files"},
+{"id":"m2","timestamp":"2026-08-25T01:00:02.000Z","type":"gemini","content":"","model":"gemini-3-pro","toolCalls":[{"id":"t1","name":"list_directory","args":{"path":"."},"status":"success"}],"tokens":{"input":1200,"output":40,"cached":800,"thoughts":30,"tool":150,"total":1420}},
+{"id":"m3","timestamp":"2026-08-25T01:00:05.000Z","type":"gemini","content":"done","model":"gemini-3-pro","tokens":{"input":1500,"output":60,"cached":1000,"thoughts":0,"tool":0,"total":1560}}
+]}

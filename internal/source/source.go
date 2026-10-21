@@ -212,6 +212,12 @@ func collectAgent(agent string, c *cache.Cache) ([]model.Usage, []Issue) {
 		return nil, nil
 	}
 	files, unread := listFiles(roots, match)
+	if agent == "codex" {
+		files = codexPreferred(roots, files)
+	}
+	if agent == "gemini" {
+		files = geminiPreferred(files)
+	}
 	recs, issues := mapFiles(agent, files, c, parse)
 	for _, d := range unread {
 		issues = append(issues, Issue{Agent: agent, Path: d.path, Err: describe(d.path, d.err)})
@@ -233,7 +239,7 @@ func agentSpec(agent string) (roots []string, match matcher, parse parser) {
 	case "claude":
 		return sub(claudeRoots(), "projects"), suffix(".jsonl"), parseClaude
 	case "codex":
-		return sub(codexRoots(), "sessions"), suffix(".jsonl"), parseCodex
+		return codexSessionDirs(codexRoots()), codexRollout, parseCodex
 	case "grok":
 		return sub(grokRoots(), "sessions"), named("updates.jsonl"), parseGrok
 	case "gemini":
@@ -243,6 +249,43 @@ func agentSpec(agent string) (roots []string, match matcher, parse parser) {
 	default:
 		return nil, nil, nil
 	}
+}
+
+// codexSessionDirs lists, for every Codex home in turn, its live sessions/
+// and then archived_sessions/, where Codex moves rollouts it archives. The
+// order matters to codexPreferred.
+func codexSessionDirs(homes []string) []string {
+	var out []string
+	for _, h := range homes {
+		out = append(out, filepath.Join(h, "sessions"), filepath.Join(h, "archived_sessions"))
+	}
+	return out
+}
+
+// codexPreferred keeps one file per rollout of each Codex home. A rollout
+// found at the same path under both sessions/ and archived_sessions/ is read
+// from whichever dir comes first in roots, the live sessions/, as ccusage
+// does, whatever its encoding. Within a dir, x.jsonl sorts before
+// x.jsonl.zst, so the plain copy wins, as it does in Codex, which restores it
+// on resume before deleting the .zst. files must be in the order listFiles
+// walked roots.
+func codexPreferred(roots, files []string) []string {
+	seen := map[string]bool{}
+	out := files[:0:0]
+	for _, f := range files {
+		key := f
+		for _, r := range roots {
+			if rel, err := filepath.Rel(r, f); err == nil && !strings.HasPrefix(rel, "..") {
+				key = filepath.Join(filepath.Dir(r), strings.TrimSuffix(rel, ".zst"))
+				break
+			}
+		}
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 // sub appends the same path elements to every root.
@@ -261,9 +304,9 @@ func Infos() []model.SourceInfo {
 		agent, note string
 	}{
 		{"claude", "Claude Code session jsonl"},
-		{"codex", "Codex rollout jsonl"},
+		{"codex", "Codex rollout jsonl[.zst] (sessions + archived_sessions)"},
 		{"grok", "Grok turn_completed.usage"},
-		{"gemini", "Gemini CLI session json"},
+		{"gemini", "Gemini CLI chats json/jsonl"},
 		{"opencode", "OpenCode assistant messages"},
 	}
 	var out []model.SourceInfo
@@ -279,6 +322,17 @@ func Infos() []model.SourceInfo {
 				info.Exists = true
 				files, _ := listFiles([]string{root}, match)
 				info.Files = len(files)
+				if s.agent == "codex" {
+					// Count only what is read from this root: an archived
+					// rollout still live in sessions/ is read from there.
+					all, _ := listFiles(roots, match)
+					info.Files = 0
+					for _, f := range codexPreferred(roots, all) {
+						if rel, err := filepath.Rel(root, f); err == nil && !strings.HasPrefix(rel, "..") {
+							info.Files++
+						}
+					}
+				}
 			}
 			out = append(out, info)
 		}
@@ -387,17 +441,42 @@ func suffix(ext string) matcher {
 	}
 }
 
+// codexRollout matches a Codex rollout, plain or zstd-compressed.
+func codexRollout(path string, d fs.DirEntry) bool {
+	return !d.IsDir() && (strings.HasSuffix(d.Name(), ".jsonl") || strings.HasSuffix(d.Name(), ".jsonl.zst"))
+}
+
 func named(name string) matcher {
 	return func(_ string, d fs.DirEntry) bool {
 		return !d.IsDir() && d.Name() == name
 	}
 }
 
+// geminiPreferred drops a legacy x.json whose x.jsonl sits beside it. Gemini
+// CLI migrates a resumed .json session by appending its whole history to the
+// .jsonl and leaves the .json in place, so reading both counts it twice.
+func geminiPreferred(files []string) []string {
+	have := make(map[string]bool, len(files))
+	for _, f := range files {
+		have[f] = true
+	}
+	out := files[:0:0]
+	for _, f := range files {
+		if filepath.Ext(f) == ".json" && have[f+"l"] {
+			continue
+		}
+		out = append(out, f)
+	}
+	return out
+}
+
 func geminiChat(path string, d fs.DirEntry) bool {
-	if d.IsDir() || filepath.Ext(path) != ".json" {
+	if ext := filepath.Ext(path); d.IsDir() || (ext != ".json" && ext != ".jsonl") {
 		return false
 	}
-	return filepath.Base(filepath.Dir(path)) == "chats"
+	// Subagents are recorded one level down, in chats/<parent-session-id>/.
+	dir := filepath.Dir(path)
+	return filepath.Base(dir) == "chats" || filepath.Base(filepath.Dir(dir)) == "chats"
 }
 
 // unreadDir is a directory that listFiles could not list.
