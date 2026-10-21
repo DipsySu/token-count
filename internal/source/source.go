@@ -11,11 +11,16 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"token-count/internal/cache"
 	"token-count/internal/model"
 )
 
+// ProgressFunc reports scan progress for one agent. files is how many of that
+// agent's session files have been read so far; records is that agent's file
+// total (0 when the agent has no roots or no matching files). It is called
+// concurrently across agents, and may be called many times per agent.
 type ProgressFunc func(agent string, files, records int)
 
 // Stats describes what a collection pass saw before and after deduplication,
@@ -63,10 +68,7 @@ func CollectStats(agents []string, c *cache.Cache, progress ProgressFunc) ([]mod
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			recs, bad := collectAgent(agent, c)
-			if progress != nil {
-				progress(agent, -1, len(recs))
-			}
+			recs, bad := collectAgent(agent, c, progress)
 			if len(recs) == 0 && len(bad) == 0 {
 				return
 			}
@@ -206,9 +208,12 @@ func compareRecords(a, b model.Usage) int {
 	)
 }
 
-func collectAgent(agent string, c *cache.Cache) ([]model.Usage, []Issue) {
+func collectAgent(agent string, c *cache.Cache, progress ProgressFunc) ([]model.Usage, []Issue) {
 	roots, match, parse := agentSpec(agent)
 	if len(roots) == 0 {
+		if progress != nil {
+			progress(agent, 0, 0)
+		}
 		return nil, nil
 	}
 	files, unread := listFiles(roots, match)
@@ -218,7 +223,7 @@ func collectAgent(agent string, c *cache.Cache) ([]model.Usage, []Issue) {
 	if agent == "gemini" {
 		files = geminiPreferred(files)
 	}
-	recs, issues := mapFiles(agent, files, c, parse)
+	recs, issues := mapFiles(agent, files, c, parse, progress)
 	for _, d := range unread {
 		issues = append(issues, Issue{Agent: agent, Path: d.path, Err: describe(d.path, d.err)})
 	}
@@ -559,16 +564,20 @@ func listFiles(roots []string, match matcher) ([]string, []unreadDir) {
 	return out, unread
 }
 
-func mapFiles(agent string, files []string, c *cache.Cache, parse parser) ([]model.Usage, []Issue) {
-	if len(files) == 0 {
+func mapFiles(agent string, files []string, c *cache.Cache, parse parser, progress ProgressFunc) ([]model.Usage, []Issue) {
+	total := len(files)
+	if progress != nil {
+		progress(agent, 0, total)
+	}
+	if total == 0 {
 		return nil, nil
 	}
 	workers := runtime.GOMAXPROCS(0)
 	if workers > 8 {
 		workers = 8
 	}
-	if workers > len(files) {
-		workers = len(files)
+	if workers > total {
+		workers = total
 	}
 	in := make(chan string)
 	var (
@@ -576,6 +585,7 @@ func mapFiles(agent string, files []string, c *cache.Cache, parse parser) ([]mod
 		out    []model.Usage
 		issues []Issue
 		wg     sync.WaitGroup
+		done   atomic.Int32
 	)
 	for i := 0; i < workers; i++ {
 		wg.Add(1)
@@ -583,6 +593,10 @@ func mapFiles(agent string, files []string, c *cache.Cache, parse parser) ([]mod
 			defer wg.Done()
 			for path := range in {
 				recs, err := parseCached(c, path, parse)
+				n := int(done.Add(1))
+				if progress != nil {
+					progress(agent, n, total)
+				}
 				if len(recs) == 0 && err == nil {
 					continue
 				}

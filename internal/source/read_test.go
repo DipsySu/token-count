@@ -518,20 +518,27 @@ func TestCollectSortsIssues(t *testing.T) {
 	}
 }
 
-// The progress callback still hears from every agent once. Agents are
-// collected in parallel, so it is called concurrently.
+// The progress callback still hears from every agent. Agents are collected
+// in parallel, so it is called concurrently, and a multi-file agent may
+// report more than once as files complete.
 func TestCollectStillReportsProgress(t *testing.T) {
 	isolate(t)
 	var mu sync.Mutex
 	seen := map[string]int{}
+	last := map[string][2]int{}
 	CollectStats(model.Agents, nil, func(agent string, files, records int) {
 		mu.Lock()
 		seen[agent]++
+		last[agent] = [2]int{files, records}
 		mu.Unlock()
 	})
 	for _, a := range model.Agents {
-		if seen[a] != 1 {
-			t.Fatalf("progress saw %v", seen)
+		if seen[a] < 1 {
+			t.Fatalf("progress never saw %s: %v", a, seen)
+		}
+		got := last[a]
+		if got[0] != got[1] {
+			t.Fatalf("agent %s last progress %d/%d, want done==total", a, got[0], got[1])
 		}
 	}
 }
